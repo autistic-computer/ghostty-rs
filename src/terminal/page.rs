@@ -3284,6 +3284,121 @@ pub const fn field_mask(fields: &[BitField]) -> u64 {
 /// the remainder and for pinpointing values within a matched group.
 pub struct Mask<T, const MASK: u64, const G: usize>(PhantomData<T>);
 
+/// Whole-group compares for [`Mask`].
+///
+/// Zig writes these as `@reduce` over a `@Vector`, which LLVM lowers to a
+/// handful of vector compares. The obvious Rust (`iter().all(..)`) has an
+/// early exit, and LLVM keeps it as one compare and branch per value even
+/// when written branch-free, so on x86_64 and aarch64 these use the
+/// baseline SIMD intrinsics (SSE2, NEON) on pairs of u64 lanes instead.
+/// Other targets and odd group lengths use the scalar loop.
+mod group {
+    /// True if `v & mask == expected` for every value in the group.
+    #[inline(always)]
+    pub(super) fn all_eq<const G: usize>(g: &[u64; G], mask: u64, expected: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if G % 2 == 0 {
+            use core::arch::x86_64::*;
+            // SAFETY: SSE2 is part of the x86_64 baseline. Each unaligned
+            // load reads g[k..k + 2] with k + 2 <= G.
+            unsafe {
+                let m = _mm_set1_epi64x(mask as i64);
+                let e = _mm_set1_epi64x(expected as i64);
+                // Every 32-bit half equal means every 64-bit lane is.
+                let mut eq = _mm_set1_epi32(-1);
+                let mut k = 0;
+                while k < G {
+                    let v = _mm_loadu_si128(g.as_ptr().add(k).cast());
+                    eq = _mm_and_si128(eq, _mm_cmpeq_epi32(_mm_and_si128(v, m), e));
+                    k += 2;
+                }
+                return _mm_movemask_epi8(eq) == 0xFFFF;
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if G % 2 == 0 {
+            use core::arch::aarch64::*;
+            // SAFETY: NEON is enabled. Each load reads g[k..k + 2] with
+            // k + 2 <= G.
+            unsafe {
+                let m = vdupq_n_u64(mask);
+                let e = vdupq_n_u64(expected);
+                let mut diff = vdupq_n_u64(0);
+                let mut k = 0;
+                while k < G {
+                    let v = vld1q_u64(g.as_ptr().add(k));
+                    diff = vorrq_u64(diff, veorq_u64(vandq_u64(v, m), e));
+                    k += 2;
+                }
+                return vmaxvq_u32(vreinterpretq_u32_u64(diff)) == 0;
+            }
+        }
+        g.iter().fold(0, |acc, v| acc | ((v & mask) ^ expected)) == 0
+    }
+
+    /// True if `v & mask == expected` for at least one value in the group.
+    #[inline(always)]
+    pub(super) fn any_eq<const G: usize>(g: &[u64; G], mask: u64, expected: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if G % 2 == 0 {
+            use core::arch::x86_64::*;
+            // SAFETY: as in all_eq.
+            unsafe {
+                if mask >> 32 == 0 && G % 4 == 0 {
+                    // Only the low halves can differ: pack the low halves
+                    // of four lanes into one vector and compare once.
+                    if expected >> 32 != 0 {
+                        return false;
+                    }
+                    let m = _mm_set1_epi32(mask as i32);
+                    let e = _mm_set1_epi32(expected as i32);
+                    let mut hit = _mm_setzero_si128();
+                    let mut k = 0;
+                    while k < G {
+                        let a = _mm_castsi128_ps(_mm_loadu_si128(g.as_ptr().add(k).cast()));
+                        let b = _mm_castsi128_ps(_mm_loadu_si128(g.as_ptr().add(k + 2).cast()));
+                        let lo = _mm_castps_si128(_mm_shuffle_ps::<0b10_00_10_00>(a, b));
+                        hit = _mm_or_si128(hit, _mm_cmpeq_epi32(_mm_and_si128(lo, m), e));
+                        k += 4;
+                    }
+                    return _mm_movemask_epi8(hit) != 0;
+                }
+                let m = _mm_set1_epi64x(mask as i64);
+                let e = _mm_set1_epi64x(expected as i64);
+                let mut hit = _mm_setzero_si128();
+                let mut k = 0;
+                while k < G {
+                    let v = _mm_loadu_si128(g.as_ptr().add(k).cast());
+                    // SSE2 has no 64-bit compare: a lane is equal when both
+                    // of its 32-bit halves are.
+                    let eq = _mm_cmpeq_epi32(_mm_and_si128(v, m), e);
+                    hit = _mm_or_si128(hit, _mm_and_si128(eq, _mm_shuffle_epi32::<0b10_11_00_01>(eq)));
+                    k += 2;
+                }
+                return _mm_movemask_epi8(hit) != 0;
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if G % 2 == 0 {
+            use core::arch::aarch64::*;
+            // SAFETY: as in all_eq.
+            unsafe {
+                let m = vdupq_n_u64(mask);
+                let e = vdupq_n_u64(expected);
+                let mut hit = vdupq_n_u64(0);
+                let mut k = 0;
+                while k < G {
+                    let v = vld1q_u64(g.as_ptr().add(k));
+                    hit = vorrq_u64(hit, vceqq_u64(vandq_u64(v, m), e));
+                    k += 2;
+                }
+                return vmaxvq_u32(vreinterpretq_u32_u64(hit)) != 0;
+            }
+        }
+        g.iter().fold(false, |acc, v| acc | (v & mask == expected))
+    }
+}
+
 impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     const MASK_VALUE: u64 = MASK;
 
@@ -3294,7 +3409,9 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// Asserts that at least group_len values are available.
     #[inline(always)]
     fn load(values: &[T], i: usize) -> [u64; G] {
-        let group = &values[i..i + G];
+        // Sliced as `[i..][..G]` so the length check is the same
+        // `len - i >= G` that group scans loop on, and folds into it.
+        let group = &values[i..][..G];
         core::array::from_fn(|j| group[j].to_bits())
     }
 
@@ -3348,7 +3465,7 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// outside the mask, use `eqlExact` instead.
     #[inline(always)]
     pub fn eql(values: &[T], i: usize, expected: u64) -> bool {
-        Self::load(values, i).iter().all(|v| v & Self::MASK_VALUE == expected)
+        group::all_eq(&Self::load(values, i), Self::MASK_VALUE, expected)
     }
 
     /// Scalar variant of `eql` for a single value.
@@ -3365,7 +3482,7 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// encounters a sentinel codepoint anywhere in the group.
     #[inline(always)]
     pub fn eql_any(values: &[T], i: usize, expected: u64) -> bool {
-        Self::load(values, i).iter().any(|v| v & Self::MASK_VALUE == expected)
+        group::any_eq(&Self::load(values, i), Self::MASK_VALUE, expected)
     }
 
     /// Like `eql` but returns the number of leading values whose
@@ -3415,7 +3532,7 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// correct and cheap.
     #[inline(always)]
     pub fn eql_exact(values: &[T], i: usize, expected: u64) -> bool {
-        Self::load(values, i).iter().all(|&v| v == expected)
+        group::all_eq(&Self::load(values, i), u64::MAX, expected)
     }
 }
 
@@ -3605,6 +3722,48 @@ mod tests {
         }
 
         assert_eq!(M::GROUP_LEN, 4);
+    }
+
+    /// The SIMD group compares must agree with the per-value definition for
+    /// every mix of lanes: a mask spanning both 32-bit halves (M1), one in the
+    /// low half only (M2, which takes the packed `eql_any` path on x86_64),
+    /// and the whole value (`eql_exact`).
+    #[test]
+    fn mask_group_compares_match_scalar() {
+        fn check<const MASK: u64>(cells: &[Cell], expected: u64) {
+            type G<const MASK: u64> = Mask<Cell, MASK, 4>;
+            let pick = |n: usize| -> [Cell; 4] { core::array::from_fn(|i| cells[(n >> (2 * i)) & 3]) };
+            for n in 0..256 {
+                let group = pick(n);
+                let hits = group.map(|c| G::<MASK>::pattern(c) == expected);
+                assert_eq!(hits.iter().all(|&h| h), G::<MASK>::eql(&group, 0, expected));
+                assert_eq!(hits.iter().any(|&h| h), G::<MASK>::eql_any(&group, 0, expected));
+                let exact = group.map(|c| c.to_bits() == expected);
+                assert_eq!(exact.iter().all(|&h| h), G::<MASK>::eql_exact(&group, 0, expected));
+            }
+        }
+
+        let a = Cell::init('A' as u32);
+        let mut a_styled = a;
+        a_styled.set_style_id(5);
+        let mut b_styled = Cell::init('B' as u32);
+        b_styled.set_style_id(5);
+        let mut b_other = b_styled;
+        b_other.set_style_id(0x8001);
+        let cells = [a, a_styled, b_styled, b_other];
+
+        const M1_MASK: u64 = field_mask(&[cell_fields::CONTENT_TAG, cell_fields::STYLE_ID]);
+        const M2_MASK: u64 = field_mask(&[cell_fields::CONTENT_CODEPOINT_DATA]);
+        assert!(M1_MASK >> 32 != 0 && M1_MASK as u32 != 0);
+        assert!(M2_MASK >> 32 == 0);
+
+        for &c in &cells {
+            check::<M1_MASK>(&cells, M1::pattern(c));
+            check::<M2_MASK>(&cells, M2::pattern(c));
+            check::<M1_MASK>(&cells, c.to_bits());
+        }
+        // An expected value with bits outside a low-half mask never matches.
+        check::<M2_MASK>(&cells, M2::pattern(a) | 1 << 40);
     }
 
     #[test]
