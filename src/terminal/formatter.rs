@@ -5,7 +5,8 @@
 //! Notes on the port:
 //! - Writers are `std::io::Write` trait objects; Zig's
 //!   `std.Io.Writer.Error` is `std::io::Error`.
-//! - The comptime `emit` specialization is a runtime match.
+//! - The page formatter's comptime `emit` specialization is a const
+//!   generic (`EMIT_*`); elsewhere `emit` is a runtime match.
 //! - Nested Zig types are flattened: `PinMap.Map` is [`PinMapMap`],
 //!   `PinMap.NodeRun` is [`PinMapNodeRun`], `ScreenFormatter.Content` is
 //!   [`ScreenFormatterContent`], `ScreenFormatter.Extra` is
@@ -1240,6 +1241,25 @@ const MAX_ENCODING_LEN: usize = 16;
 /// Style id marking a style that didn't come from an interned id.
 const INVALID_STYLE_ID: u32 = u32::MAX;
 
+/// The size of the fast cell run path's output buffer.
+const RUN_BUF_LEN: usize = 512;
+
+/// `Format` as a const generic parameter (enums can't be one on stable
+/// Rust), for the per-format copies of the page formatter's hot loops.
+const EMIT_PLAIN: u8 = 0;
+const EMIT_VT: u8 = 1;
+const EMIT_HTML: u8 = 2;
+
+/// The `Format` of a const generic `EMIT_*` parameter.
+#[inline(always)]
+const fn emit_format<const EMIT: u8>() -> Format {
+    match EMIT {
+        EMIT_PLAIN => Format::Plain,
+        EMIT_VT => Format::Vt,
+        _ => Format::Html,
+    }
+}
+
 impl<'a> PageFormatter<'a> {
     /// Initializes a page formatter. Other options can be set directly on the
     /// struct after initialization and before calling `format()`.
@@ -1264,9 +1284,13 @@ impl<'a> PageFormatter<'a> {
 
     pub fn format_with_state(&mut self, writer: &mut dyn Write) -> io::Result<TrailingState> {
         // Specialize the hot path on the emitted format so that the
-        // per-cell loop contains no per-cell format dispatch.
-        let emit = self.opts.emit;
-        self.format_with_state_emit(writer, emit)
+        // per-cell loop contains no per-cell format dispatch (Zig: an
+        // `inline else` over a comptime `emit`; Rust: a const generic).
+        match self.opts.emit {
+            Format::Plain => self.format_with_state_emit::<EMIT_PLAIN>(writer),
+            Format::Vt => self.format_with_state_emit::<EMIT_VT>(writer),
+            Format::Html => self.format_with_state_emit::<EMIT_HTML>(writer),
+        }
     }
 
     fn cells_of(&self, row: &Row) -> &'a [Cell] {
@@ -1274,7 +1298,8 @@ impl<'a> PageFormatter<'a> {
         unsafe { &*self.page.get_cells(row) }
     }
 
-    fn format_with_state_emit(&mut self, writer: &mut dyn Write, emit: Format) -> io::Result<TrailingState> {
+    fn format_with_state_emit<const EMIT: u8>(&mut self, writer: &mut dyn Write) -> io::Result<TrailingState> {
+        let emit = emit_format::<EMIT>();
         let mut blank_rows: usize = 0;
         let mut blank_cells: usize = 0;
 
@@ -1372,6 +1397,12 @@ impl<'a> PageFormatter<'a> {
         let mut style: Style = Style::default();
         let mut style_id: u32 = 0;
 
+        // Whether `style` is the default style, kept alongside it so the
+        // loop asks once per style change instead of at every check
+        // (Zig calls `style.default()` each time; Rust's `eql` is an
+        // out-of-line field compare here, a measurable cost per change).
+        let mut style_default: bool = true;
+
         // Whether the codepoint map has any entries. Hoisted out of the
         // per-codepoint path so that the common no-map case can use the
         // fast cell run path below.
@@ -1386,6 +1417,12 @@ impl<'a> PageFormatter<'a> {
 
         // Most pages hold no hyperlinks, so check once instead of per cell.
         let page_hyperlinks = self.page.hyperlink_count() > 0;
+
+        // The fast path's output buffer. Zig leaves it undefined inside
+        // writeCellRun; Rust has to initialize it, so it is zeroed once
+        // per page here rather than on every run (a 512-byte memset per
+        // run is a large share of a styled row's cost).
+        let mut run_buf = [0u8; RUN_BUF_LEN];
 
         for y_usize in start_y as usize..end_y as usize + 1 {
             let y: CellCountInt = y_usize as CellCountInt;
@@ -1436,10 +1473,12 @@ impl<'a> PageFormatter<'a> {
             if blank_rows > 0 {
                 // Reset style before emitting newlines to prevent background
                 // colors from bleeding into the next line's leading cells.
-                if !style.is_default() {
+                debug_assert_eq!(style_default, style.is_default());
+                if !style_default {
                     self.format_style_close(emit, writer)?;
                     style = Style::default();
                     style_id = 0;
+                    style_default = true;
                 }
 
                 let sequence: &[u8] = match emit {
@@ -1538,20 +1577,32 @@ impl<'a> PageFormatter<'a> {
 
                     // Pages without hyperlinks take a copy of the run
                     // loop that never checks for them.
-                    let hyperlinks = format_styled(emit) && page_hyperlinks;
                     let track_points = self.point_map.is_some();
-                    let consumed = self.write_cell_run(
-                        emit,
-                        hyperlinks,
-                        track_points,
-                        writer,
-                        &cells_subset[cell_i..],
-                        x,
-                        y,
-                        style_id,
-                        current_hyperlink_id,
-                        &mut blank_cells,
-                    )?;
+                    let consumed = if format_styled(emit) && page_hyperlinks {
+                        self.write_cell_run::<EMIT, true>(
+                            track_points,
+                            writer,
+                            &mut run_buf,
+                            &cells_subset[cell_i..],
+                            x,
+                            y,
+                            style_id,
+                            current_hyperlink_id,
+                            &mut blank_cells,
+                        )?
+                    } else {
+                        self.write_cell_run::<EMIT, false>(
+                            track_points,
+                            writer,
+                            &mut run_buf,
+                            &cells_subset[cell_i..],
+                            x,
+                            y,
+                            style_id,
+                            current_hyperlink_id,
+                            &mut blank_cells,
+                        )?
+                    };
 
                     // Zero cells consumed means the first cell isn't
                     // eligible for the fast path; handle it below.
@@ -1610,7 +1661,7 @@ impl<'a> PageFormatter<'a> {
                         // of the text before them.
                         self.write_blank_step(writer, blank_cells, x, y)?;
                         blank_cells = 0;
-                    } else if !style.is_default() {
+                    } else if !style_default {
                         // Blanks carried over from a wrapped row can't
                         // be: CUF stops at the end of the row. They are
                         // written as spaces, without the pen of the text
@@ -1618,6 +1669,7 @@ impl<'a> PageFormatter<'a> {
                         self.format_style_close(emit, writer)?;
                         style = Style::default();
                         style_id = 0;
+                        style_default = true;
                     }
                 }
 
@@ -1659,8 +1711,9 @@ impl<'a> PageFormatter<'a> {
                         break 'style;
                     }
 
-                    // Get our cell style.
+                    // Get our cell style. Style id 0 is the default style.
                     let cell_style = self.cell_style(cell);
+                    let cell_default = cell_style_id == style::DEFAULT_ID as u32 || style_is_default(&cell_style);
 
                     // If the style hasn't changed, don't bloat output.
                     // When both ids are interned (and thus different, since
@@ -1674,7 +1727,8 @@ impl<'a> PageFormatter<'a> {
                     // If we had a previous style, we need to close it,
                     // because we've confirmed we have some new style
                     // (which is maybe default).
-                    if !style.is_default() {
+                    debug_assert_eq!(style_default, style.is_default());
+                    if !style_default {
                         match emit {
                             Format::Html => self.format_style_close(emit, writer)?,
 
@@ -1682,7 +1736,7 @@ impl<'a> PageFormatter<'a> {
                             // style because any non-default style will emit
                             // a \x1b[0m as the start of a VT coloring sequence.
                             Format::Vt => {
-                                if cell_style.is_default() {
+                                if cell_default {
                                     self.format_style_close(emit, writer)?;
                                 }
                             }
@@ -1696,9 +1750,10 @@ impl<'a> PageFormatter<'a> {
                     // At this point, we can copy our style over
                     style = cell_style;
                     style_id = cell_style_id;
+                    style_default = cell_default;
 
                     // If we're just the default style now, we're done.
-                    if cell_style.is_default() {
+                    if cell_default {
                         break 'style;
                     }
 
@@ -1825,7 +1880,8 @@ impl<'a> PageFormatter<'a> {
         }
 
         // If the style is non-default, we need to close our style tag.
-        if !style.is_default() {
+        debug_assert_eq!(style_default, style.is_default());
+        if !style_default {
             self.format_style_close(emit, writer)?;
         }
 
@@ -1879,13 +1935,16 @@ impl<'a> PageFormatter<'a> {
     /// Blank cell accounting matches the slow path: accumulated blanks
     /// are only materialized once a non-blank cell is found, and any
     /// remainder is written back to `blank_cells`.
+    // Deliberately not inlined: this is instantiated per emit format and
+    // inlining every copy into formatWithStateEmit's row loop bloats the
+    // binary. track_points is a runtime bool for the same reason.
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    fn write_cell_run(
+    fn write_cell_run<const EMIT: u8, const HYPERLINKS: bool>(
         &mut self,
-        emit: Format,
-        hyperlinks: bool,
         track_points: bool,
         writer: &mut dyn Write,
+        buf: &mut [u8; RUN_BUF_LEN],
         cells: &[Cell],
         run_x: CellCountInt,
         run_y: CellCountInt,
@@ -1894,8 +1953,9 @@ impl<'a> PageFormatter<'a> {
         blank_cells: &mut usize,
     ) -> io::Result<usize> {
         debug_assert!(track_points == self.point_map.is_some());
+        let emit = emit_format::<EMIT>();
+        let hyperlinks = HYPERLINKS;
 
-        let mut buf = [0u8; 512];
         let mut len: usize = 0;
         let mut pending: usize = *blank_cells;
 
@@ -2014,13 +2074,13 @@ impl<'a> PageFormatter<'a> {
                 len += 1;
                 cell_bytes = 1;
             } else {
-                cell_bytes = encode_codepoint(emit, &mut buf, &mut len, cp);
+                cell_bytes = encode_codepoint(emit, buf, &mut len, cp);
 
                 // Multi-codepoint graphemes emit their extra codepoints,
                 // matching writeCell. This is out-of-line to keep the
                 // hot loop for the common single-codepoint case small.
                 if cell.content_tag() == ContentTag::CodepointGrapheme {
-                    cell_bytes += self.write_grapheme_cps(emit, writer, cell, &mut buf, &mut len)?;
+                    cell_bytes += self.write_grapheme_cps(emit, writer, cell, buf, &mut len)?;
                 }
             }
 
@@ -2051,7 +2111,7 @@ impl<'a> PageFormatter<'a> {
         emit: Format,
         writer: &mut dyn Write,
         cell: &Cell,
-        buf: &mut [u8; 512],
+        buf: &mut [u8; RUN_BUF_LEN],
         len: &mut usize,
     ) -> io::Result<usize> {
         let mut bytes: usize = 0;
@@ -2126,6 +2186,25 @@ impl<'a> PageFormatter<'a> {
             return Ok(());
         }
 
+        // Without a codepoint map nothing is replaced: encode the cell's
+        // codepoints into one buffer and write it once, rather than one
+        // writer call per codepoint (same bytes as the loop below).
+        if self.opts.codepoint_map.as_ref().is_none_or(|m| m.is_empty()) {
+            let mut buf = [0u8; 64];
+            let mut len: usize = 0;
+            encode_codepoint(emit, &mut buf, &mut len, cell.content_codepoint());
+            if tag == ContentTag::CodepointGrapheme {
+                for &cp in self.page.lookup_grapheme(cell).unwrap() {
+                    if len + MAX_ENCODING_LEN > buf.len() {
+                        writer.write_all(&buf[..len])?;
+                        len = 0;
+                    }
+                    encode_codepoint(emit, &mut buf, &mut len, cp);
+                }
+            }
+            return writer.write_all(&buf[..len]);
+        }
+
         self.write_codepoint_with_replacement(emit, writer, cell.content_codepoint())?;
         if tag == ContentTag::CodepointGrapheme {
             for &cp in self.page.lookup_grapheme(cell).unwrap() {
@@ -2168,6 +2247,7 @@ impl<'a> PageFormatter<'a> {
 
     /// Returns the style for the given cell. If there is no styling this
     /// will return the default style.
+    #[inline(always)]
     fn cell_style(&self, cell: &Cell) -> Style {
         match cell.content_tag() {
             ContentTag::Codepoint | ContentTag::CodepointGrapheme => {
@@ -2207,7 +2287,9 @@ impl<'a> PageFormatter<'a> {
             Format::Vt => {
                 let mut formatter = style.formatter_vt();
                 formatter.palette = self.opts.palette;
-                write!(writer, "{formatter}")
+                let mut buf = [0u8; style::VtFormatter::MAX_LEN];
+                let len = formatter.encode(&mut buf);
+                writer.write_all(&buf[..len])
             }
 
             // We use `display: inline` so that the div doesn't impact
@@ -2314,8 +2396,8 @@ impl<'a> PageFormatter<'a> {
 /// Encode a single codepoint into buf at len, advancing len and
 /// returning the number of bytes written. The caller must guarantee
 /// enough remaining buffer space for the largest possible encoding.
-#[inline]
-fn encode_codepoint(emit: Format, buf: &mut [u8; 512], len: &mut usize, cp: u32) -> usize {
+#[inline(always)]
+fn encode_codepoint<const N: usize>(emit: Format, buf: &mut [u8; N], len: &mut usize, cp: u32) -> usize {
     let start = *len;
     match emit {
         Format::Plain | Format::Vt => {
@@ -2358,6 +2440,15 @@ fn encode_codepoint(emit: Format, buf: &mut [u8; 512], len: &mut usize, cp: u32)
     }
 
     *len - start
+}
+
+/// `Style::is_default`, inlined: once per style change in the page
+/// formatter, where the out-of-line `Style::eql` call showed up in
+/// profiles of styled output.
+#[inline(always)]
+fn style_is_default(s: &Style) -> bool {
+    let none = |c: style::Color| matches!(c, style::Color::None);
+    s.flags == style::Flags::default() && none(s.fg_color) && none(s.bg_color) && none(s.underline_color)
 }
 
 /// Whether any of the cells only carries a background color.
@@ -5130,6 +5221,56 @@ mod tests {
         // "red text" becomes "rXd tXxt"
         // VT format uses \x1b[38;5;1m for palette color 1
         assert_eq!("\x1b[0m\x1b[38;5;1mrXd tXxt\x1b[0m", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn page_long_grapheme_after_style_change() {
+        // A styled cell takes the per-cell path, which encodes a cell's
+        // codepoints into one small buffer when there is no codepoint
+        // map. A long grapheme fills it more than once; a map that
+        // matches nothing takes the per-codepoint path, and both must
+        // write the same bytes.
+        let mut t = term(20, 5);
+        let marks: String = std::iter::repeat_n('\u{301}', 40).collect();
+        feed(&mut t, format!("a\x1b[31me{marks}\x1b[0m b"));
+
+        for emit in [Format::Plain, Format::Vt, Format::Html] {
+            let fast = fmt_last_page_nomap(&t, opts(emit));
+            let mut o = opts(emit);
+            o.codepoint_map = Some(vec![cp_map(['\u{E000}', '\u{E000}'], Replacement::Codepoint('x' as u32))]);
+            assert_eq!(fmt_last_page_nomap(&t, o), fast, "{emit:?}");
+            match emit {
+                Format::Plain => assert_eq!(format!("ae{marks} b"), fast),
+                Format::Vt => assert_eq!(format!("a\x1b[0m\x1b[38;5;1me{marks}\x1b[0m b"), fast),
+                Format::Html => assert!(fast.contains(&format!("e{}", "&#769;".repeat(40))), "{fast}"),
+            }
+        }
+    }
+
+    #[test]
+    fn style_is_default_matches_style() {
+        let base = Style::default();
+        assert!(style_is_default(&base));
+        let mut styles = Vec::new();
+        let mut s = base;
+        s.fg_color = style::Color::Palette(0);
+        styles.push(s);
+        let mut s = base;
+        s.bg_color = style::Color::Rgb(color::Rgb { r: 0, g: 0, b: 0 });
+        styles.push(s);
+        let mut s = base;
+        s.underline_color = style::Color::Palette(3);
+        styles.push(s);
+        let mut s = base;
+        s.flags.overline = true;
+        styles.push(s);
+        let mut s = base;
+        s.flags.underline = crate::terminal::sgr::Underline::Dashed;
+        styles.push(s);
+        for s in styles {
+            assert!(!s.is_default());
+            assert!(!style_is_default(&s), "{s:?}");
+        }
     }
 
     #[test]
