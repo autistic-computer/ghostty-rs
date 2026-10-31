@@ -7,7 +7,9 @@
 # third_party/ghostty (it holds include/ and lib/libghostty-vt.a). The same
 # compare.c is built against that library and against this crate's static
 # library, both run the cases from generate.py at several write-chunk sizes,
-# and every snapshot line must match.
+# and every snapshot line must match. BUILD_ONLY=1 stops after building the
+# two runners in OUT (fuzz.py uses this). RUST_PROFILE=dev builds the crate
+# with debug assertions, which turn on the page integrity checks.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -15,8 +17,10 @@ zig=${1:?usage: run.sh ZIG_PREFIX}
 out=${OUT:-$root/target/differential}
 mkdir -p "$out"
 
-cargo rustc -q --release --manifest-path "$root/Cargo.toml" --no-default-features --features lib-vt --lib --crate-type staticlib
-rust_lib="${CARGO_TARGET_DIR:-$root/target}/release/libghostty.a"
+profile=${RUST_PROFILE:-release}
+cargo rustc -q --profile "$profile" --manifest-path "$root/Cargo.toml" --no-default-features --features lib-vt --lib --crate-type staticlib
+[ "$profile" = dev ] && profile=debug
+rust_lib="${CARGO_TARGET_DIR:-$root/target}/$profile/libghostty.a"
 
 case "$(uname -s)" in
 Darwin) cxx=-lc++; sys= ;;
@@ -24,6 +28,7 @@ Darwin) cxx=-lc++; sys= ;;
 esac
 cc -O2 -I "$zig/include" "$here/compare.c" "$zig/lib/libghostty-vt.a" $cxx $sys -o "$out/zig-runner"
 cc -O2 -I "$root/include" "$here/compare.c" "$rust_lib" $sys -o "$out/rust-runner"
+[ -n "${BUILD_ONLY:-}" ] && exit 0
 python3 -I "$here/generate.py" "$out/cases.bin" >/dev/null
 
 fail=0
