@@ -137,6 +137,60 @@ type PageAlloc = AllocPosix;
 #[cfg(windows)]
 type PageAlloc = AllocWindows;
 
+/// Test builds keep a ledger of every live mapping made for page memory,
+/// by `Page` itself (AllocPosix, for `Page::init` and clones) or by the
+/// PageList page allocator (OsPageAllocator), and panic when one is
+/// unmapped twice, unmapped with another length, or freed through the
+/// other allocator. Unmapping an
+/// address twice is harmless until another thread maps something there in
+/// between, so without this check such a bug only shows up as rare memory
+/// corruption in parallel test runs.
+#[cfg(all(test, unix))]
+pub(crate) mod map_track {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// Start address of each live mapping, with its length and kind.
+    static LIVE: Mutex<BTreeMap<usize, (usize, &'static str)>> = Mutex::new(BTreeMap::new());
+
+    fn live() -> std::sync::MutexGuard<'static, BTreeMap<usize, (usize, &'static str)>> {
+        LIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a fresh mapping of `len` bytes at `ptr`.
+    pub(crate) fn mapped(ptr: *mut u8, len: usize, kind: &'static str) {
+        let addr = ptr as usize;
+        let mut live = live();
+        if let Some((&start, &(l, k))) = live.range(..addr + len).next_back() {
+            assert!(
+                start + l <= addr,
+                "{kind} mapping {addr:#x}+{len:#x} overlaps live {k} mapping {start:#x}+{l:#x}"
+            );
+        }
+        live.insert(addr, (len, kind));
+    }
+
+    /// Check and forget the mapping at `ptr` before it is unmapped.
+    pub(crate) fn unmapping(ptr: *mut u8, len: usize, kind: &'static str) {
+        let addr = ptr as usize;
+        let mut live = live();
+        // A mismatch leaves the entry in place: the panic stops the unmap.
+        match live.get(&addr).copied() {
+            Some((l, k)) if l == len && k == kind => {
+                live.remove(&addr);
+            }
+            Some((l, k)) => {
+                drop(live);
+                panic!("{kind} unmap of {addr:#x}+{len:#x} but the live mapping is {k} {addr:#x}+{l:#x}");
+            }
+            None => {
+                drop(live);
+                panic!("{kind} unmap of {addr:#x}+{len:#x}, which is not a live mapping (unmapped twice?)");
+            }
+        }
+    }
+}
+
 /// Allocate page-aligned, zeroed backing memory using mmap with
 /// MAP_PRIVATE | MAP_ANONYMOUS which guarantees zeroed pages.
 #[cfg(not(windows))]
@@ -159,11 +213,15 @@ impl AllocPosix {
         if ptr == libc::MAP_FAILED || ptr.is_null() {
             return Err(AllocError::OutOfMemory);
         }
+        #[cfg(all(test, unix))]
+        map_track::mapped(ptr.cast(), n, "Page");
         // SAFETY: mmap returned a valid mapping of `n` bytes.
         Ok(unsafe { PageMemory::from_raw_parts(ptr.cast(), n) })
     }
 
     fn free(mem: PageMemory) {
+        #[cfg(all(test, unix))]
+        map_track::unmapping(mem.ptr(), mem.len(), "Page");
         // SAFETY: `mem` was returned by `alloc` (or covers a whole mapping).
         unsafe { libc::munmap(mem.ptr().cast(), mem.len()) };
     }

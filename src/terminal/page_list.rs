@@ -288,11 +288,16 @@ unsafe impl GlobalAlloc for OsPageAllocator {
             // On macOS we want to tag our memory so we can assign it to our
             // core terminal usage.
             use crate::os::mach;
-            return mach::TaggedPageAllocator::map(
+            let ptr = mach::TaggedPageAllocator::map(
                 layout.size(),
                 layout.align().trailing_zeros() as u8,
                 mach::VMTag::APPLICATION_SPECIFIC_1,
             );
+            #[cfg(test)]
+            if !ptr.is_null() {
+                pagepkg::map_track::mapped(ptr, layout.size(), "page allocator");
+            }
+            return ptr;
         }
 
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -312,6 +317,8 @@ unsafe impl GlobalAlloc for OsPageAllocator {
             if ptr == libc::MAP_FAILED {
                 return core::ptr::null_mut();
             }
+            #[cfg(test)]
+            pagepkg::map_track::mapped(ptr.cast(), layout.size(), "page allocator");
             return ptr.cast();
         }
 
@@ -322,6 +329,9 @@ unsafe impl GlobalAlloc for OsPageAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: AllocLayout) {
+        #[cfg(all(test, unix))]
+        pagepkg::map_track::unmapping(ptr, layout.size(), "page allocator");
+
         #[cfg(target_os = "macos")]
         {
             crate::os::mach::TaggedPageAllocator::unmap(ptr, layout.size());
@@ -20476,5 +20486,20 @@ mod tests {
         assert_eq!(0, frozen.memory_stats().unmapped_raw_bytes);
         assert_eq!(0, rejecting.allocations());
         assert!(!rejecting.has_induced_failure());
+    }
+
+    /// A pool page's memory belongs to its node until the node is destroyed.
+    /// Freeing it through `Page::deinit` unmaps it there and again when the
+    /// PageList drops, and that second unmap destroys whatever another thread
+    /// mapped at the same address in between. The test-build mapping ledger
+    /// (`page::map_track`) rejects the first free.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "but the live mapping is page allocator")]
+    fn freeing_a_pool_page_through_page_deinit_is_rejected() {
+        let s = init(80, 24);
+        assert_eq!(Owned::Pool, n(first(&s)).owned);
+        let mut page = *pg(first(&s));
+        page.deinit();
     }
 }
