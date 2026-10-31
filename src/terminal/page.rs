@@ -1228,6 +1228,11 @@ impl Page {
         } else {
             // We have managed memory, so we have to do a slower copy to
             // get all of that right.
+            //
+            // Cross-page copies remember the last source hyperlink id and
+            // the destination id it mapped to, so runs of the same link in
+            // a row bump the refcount without hashing the URI again.
+            let mut last_hyperlink: Option<(hyperlink::Id, hyperlink::Id)> = None;
             for i in 0..len {
                 // SAFETY: within the rows; src and dst are different cells.
                 let (src_cell, dst_cell) = unsafe { (&*other_cells.add(i), &mut *cells.add(i)) };
@@ -1269,9 +1274,17 @@ impl Page {
                             return Err(CloneFromError::HyperlinkMapOutOfMemory);
                         }
 
-                        // SAFETY: `other.memory` is the other page's base.
-                        let other_link: hyperlink::PageEntry = unsafe { *other.hyperlink_set.get(other.memory, id) };
                         let dst_id = 'dst_id: {
+                            if let Some((last_src, last_dst)) = last_hyperlink {
+                                if last_src == id {
+                                    // SAFETY: `self.memory` is the page base.
+                                    unsafe { self.hyperlink_set.use_(self.memory, last_dst) };
+                                    break 'dst_id last_dst;
+                                }
+                            }
+
+                            // SAFETY: `other.memory` is the other page's base.
+                            let other_link: hyperlink::PageEntry = unsafe { *other.hyperlink_set.get(other.memory, id) };
                             // First check if the link already exists in our page,
                             // and increment its refcount if so, since we're about
                             // to use it.
@@ -1324,6 +1337,7 @@ impl Page {
                         };
 
                         self.set_hyperlink(dst_row, dst_cell, dst_id)?;
+                        last_hyperlink = Some((id, dst_id));
                     }
                 }
                 if src_cell.style_id() != style::DEFAULT_ID {
@@ -4176,6 +4190,153 @@ mod tests {
 
         // We should have the same number of hyperlinks
         assert_eq!(page2.hyperlink_count(), page.hyperlink_count());
+    }
+
+    fn hyperlink_items(n: usize) -> size::HyperlinkCountInt {
+        (n * core::mem::size_of::<hyperlink::SetItem>()) as size::HyperlinkCountInt
+    }
+
+    fn ref_count(page: &Page, id: hyperlink::Id) -> size::CellCountInt {
+        unsafe { page.hyperlink_set.ref_count(page.memory, id) }
+    }
+
+    /// Zig: `dst.cloneRowFrom(&src, dst.getRow(0), src.getRow(0))`.
+    fn clone_row_0(dst: &mut Page, src: &Page) -> Result<(), CloneFromError> {
+        let dst_row = row(dst, 0);
+        let src_row = row(src, 0);
+        unsafe { dst.clone_row_from(src, dst_row, src_row) }
+    }
+
+    #[test]
+    fn page_clone_row_from_hyperlink_runs_remap_ids_and_release_references() {
+        let mut src = init(Capacity {
+            hyperlink_bytes: hyperlink_items(32),
+            ..Capacity::new(10, 1)
+        });
+        let mut dst = init(src.capacity);
+
+        let a = src
+            .insert_hyperlink(&link(HyperlinkId::Explicit(Cow::Borrowed(b"a")), b"https://example.com/a"))
+            .unwrap();
+        let b = src
+            .insert_hyperlink(&link(HyperlinkId::Implicit(1), b"https://example.com/b"))
+            .unwrap();
+        let unrelated = dst
+            .insert_hyperlink(&link(HyperlinkId::Implicit(9), b"https://other.example"))
+            .unwrap();
+        let existing = dst
+            .insert_hyperlink(&link(HyperlinkId::Explicit(Cow::Borrowed(b"a")), b"https://example.com/a"))
+            .unwrap();
+        assert!(a != existing);
+        let ids = [Some(a), Some(a), None, Some(a), Some(b), Some(b), Some(a), None, Some(b), Some(b)];
+        for (x, maybe_id) in ids.iter().enumerate() {
+            let (row, cell) = rac(&src, x, 0);
+            *cell = cp_cell('a' as u32);
+            if let Some(id) = *maybe_id {
+                unsafe { src.hyperlink_set.use_(src.memory, id) };
+                src.set_hyperlink(row, cell, id).unwrap();
+            }
+        }
+
+        for _ in 0..2 {
+            clone_row_0(&mut dst, &src).unwrap();
+            assert_eq!(8, dst.hyperlink_count());
+            assert_eq!(5, ref_count(&dst, existing));
+            assert_eq!(1, ref_count(&dst, unrelated));
+            for (x, maybe_id) in ids.iter().enumerate() {
+                let actual = dst.lookup_hyperlink(rac(&dst, x, 0).1);
+                if let Some(id) = *maybe_id {
+                    let mapped = actual.unwrap();
+                    let expected = unsafe { &*src.hyperlink_set.get(src.memory, id) };
+                    let link = unsafe { &*dst.hyperlink_set.get(dst.memory, mapped) };
+                    assert_eq!(unsafe { expected.uri.slice(src.memory) }, unsafe {
+                        link.uri.slice(dst.memory)
+                    });
+                    if id == a {
+                        assert_eq!(existing, mapped);
+                    } else {
+                        assert_eq!(4, ref_count(&dst, mapped));
+                    }
+                } else {
+                    assert_eq!(None, actual);
+                }
+            }
+        }
+        let cols = dst.size.cols as usize;
+        let dst_row = row(&dst, 0);
+        dst.clear_cells(dst_row, 0, cols);
+        assert_eq!(0, dst.hyperlink_count());
+        assert_eq!(1, ref_count(&dst, existing));
+        assert_eq!(5, ref_count(&src, a));
+        assert_eq!(5, ref_count(&src, b));
+    }
+
+    #[test]
+    fn page_clone_row_from_repeated_hyperlink_respects_map_capacity_after_partial_failure() {
+        let mut src = init(Capacity {
+            hyperlink_bytes: hyperlink_items(32),
+            ..Capacity::new(128, 1)
+        });
+        let mut dst = init(Capacity {
+            hyperlink_bytes: hyperlink_items(4),
+            ..Capacity::new(128, 1)
+        });
+        let id = src
+            .insert_hyperlink(&link(HyperlinkId::Implicit(1), b"https://example.com"))
+            .unwrap();
+        for x in 0..src.size.cols as usize {
+            let (row, cell) = rac(&src, x, 0);
+            unsafe { src.hyperlink_set.use_(src.memory, id) };
+            src.set_hyperlink(row, cell, id).unwrap();
+        }
+        let capacity = dst.hyperlink_capacity();
+        assert!(capacity < src.size.cols as usize);
+        for _ in 0..2 {
+            assert_eq!(Err(CloneFromError::HyperlinkMapOutOfMemory), clone_row_0(&mut dst, &src));
+            assert_eq!(capacity, dst.hyperlink_count());
+            let mapped = dst.lookup_hyperlink(rac(&dst, 0, 0).1).unwrap();
+            assert_eq!(capacity, ref_count(&dst, mapped) as usize);
+            for x in 0..src.size.cols as usize {
+                assert_eq!(x < capacity, rac(&dst, x, 0).1.hyperlink());
+            }
+        }
+        let cols = dst.size.cols as usize;
+        let dst_row = row(&dst, 0);
+        dst.clear_cells(dst_row, 0, cols);
+        assert_eq!(0, dst.hyperlink_count());
+    }
+
+    #[test]
+    fn page_clone_row_from_hyperlink_memo_preserves_references_on_string_failure() {
+        let mut src = init(Capacity {
+            string_bytes: 8192,
+            ..Capacity::new(3, 1)
+        });
+        let mut dst = init(Capacity {
+            string_bytes: 128,
+            ..Capacity::new(3, 1)
+        });
+        let short = src
+            .insert_hyperlink(&link(HyperlinkId::Implicit(1), b"https://a"))
+            .unwrap();
+        let long_uri = [b'x'; 4096];
+        let long = src.insert_hyperlink(&link(HyperlinkId::Implicit(2), &long_uri)).unwrap();
+        let existing = dst
+            .insert_hyperlink(&link(HyperlinkId::Implicit(1), b"https://a"))
+            .unwrap();
+        for (x, id) in [short, short, long].into_iter().enumerate() {
+            let (row, cell) = rac(&src, x, 0);
+            unsafe { src.hyperlink_set.use_(src.memory, id) };
+            src.set_hyperlink(row, cell, id).unwrap();
+        }
+        assert_eq!(Err(CloneFromError::StringAllocOutOfMemory), clone_row_0(&mut dst, &src));
+        assert_eq!(2, dst.hyperlink_count());
+        assert_eq!(3, ref_count(&dst, existing));
+        assert!(!rac(&dst, 2, 0).1.hyperlink());
+        let cols = dst.size.cols as usize;
+        let dst_row = row(&dst, 0);
+        dst.clear_cells(dst_row, 0, cols);
+        assert_eq!(1, ref_count(&dst, existing));
     }
 
     #[test]
