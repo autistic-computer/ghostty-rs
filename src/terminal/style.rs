@@ -114,6 +114,7 @@ impl Color {
     }
 
     /// True if the color is equal to another color.
+    #[inline]
     pub fn eql(self, other: Color) -> bool {
         match (self, other) {
             (Color::None, Color::None) => true,
@@ -185,6 +186,10 @@ impl Style {
     }
 
     /// True if the style is equal to another style.
+    ///
+    /// Inline so the style set's lookups compare in place, as Zig's do;
+    /// out of line it was a call per probe.
+    #[inline]
     pub fn eql(&self, other: &Style) -> bool {
         // The branchy early-exit field compare measures faster on native
         // (unequal styles usually differ in the first field or two).
@@ -321,6 +326,7 @@ impl Style {
         }
     }
 
+    #[inline]
     pub fn hash(&self) -> u64 {
         // We pack the style in to 128 bits, fold it to 64 bits,
         // then use std.hash.int to make it sufficiently uniform.

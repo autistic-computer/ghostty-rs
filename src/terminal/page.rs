@@ -1240,6 +1240,12 @@ impl Page {
             // the destination id it mapped to, so runs of the same link in
             // a row bump the refcount without hashing the URI again.
             let mut last_hyperlink: Option<(hyperlink::Id, hyperlink::Id)> = None;
+            // Cross-page copies likewise remember the last source style id
+            // and its destination id. Zig calls addWithId for every styled
+            // cell; once a style is in this page that call only finds it
+            // again and bumps its refcount, which is all `use_` does, so
+            // runs of one style skip the hash and lookup.
+            let mut last_style: Option<(style::Id, style::Id)> = None;
             for i in 0..len {
                 // SAFETY: within the rows; src and dst are different cells.
                 let (src_cell, dst_cell) = unsafe { (&*other_cells.add(i), &mut *cells.add(i)) };
@@ -1356,6 +1362,11 @@ impl Page {
                         dst_cell.set_style_id(src_cell.style_id());
                         // SAFETY: `self.memory` is the page base.
                         unsafe { self.styles.use_(self.memory, dst_cell.style_id()) };
+                    } else if let Some((_, last_dst)) = last_style.filter(|&(src, _)| src == src_cell.style_id()) {
+                        // SAFETY: `self.memory` is the page base and
+                        // `last_dst` is alive: this loop only adds references.
+                        unsafe { self.styles.use_(self.memory, last_dst) };
+                        dst_cell.set_style_id(last_dst);
                     } else {
                         // Slow path: Get the style from the other
                         // page and add it to this page's style set.
@@ -1363,13 +1374,15 @@ impl Page {
                         let other_style: Style = unsafe { *other.styles.get(other.memory, src_cell.style_id()) };
                         // SAFETY: `self.memory` is the page base.
                         let added = unsafe { self.styles.add_with_id(self.memory, other_style, src_cell.style_id()) };
-                        dst_cell.set_style_id(match added {
+                        let dst_id = match added {
                             Ok(v) => v.unwrap_or(src_cell.style_id()),
                             // The style set capacity needs to be increased.
                             Err(AddError::OutOfMemory) => return Err(CloneFromError::StyleSetOutOfMemory),
                             // The style set needs to be rehashed.
                             Err(AddError::NeedsRehash) => return Err(CloneFromError::StyleSetNeedsRehash),
-                        });
+                        };
+                        dst_cell.set_style_id(dst_id);
+                        last_style = Some((src_cell.style_id(), dst_id));
                     }
                 }
                 if build_options::KITTY_GRAPHICS && src_cell.codepoint() == graphics_unicode::PLACEHOLDER {
@@ -3284,6 +3297,121 @@ pub const fn field_mask(fields: &[BitField]) -> u64 {
 /// the remainder and for pinpointing values within a matched group.
 pub struct Mask<T, const MASK: u64, const G: usize>(PhantomData<T>);
 
+/// Whole-group compares for [`Mask`].
+///
+/// Zig writes these as `@reduce` over a `@Vector`, which LLVM lowers to a
+/// handful of vector compares. The obvious Rust (`iter().all(..)`) has an
+/// early exit, and LLVM keeps it as one compare and branch per value even
+/// when written branch-free, so on x86_64 and aarch64 these use the
+/// baseline SIMD intrinsics (SSE2, NEON) on pairs of u64 lanes instead.
+/// Other targets and odd group lengths use the scalar loop.
+mod group {
+    /// True if `v & mask == expected` for every value in the group.
+    #[inline(always)]
+    pub(super) fn all_eq<const G: usize>(g: &[u64; G], mask: u64, expected: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if G % 2 == 0 {
+            use core::arch::x86_64::*;
+            // SAFETY: SSE2 is part of the x86_64 baseline. Each unaligned
+            // load reads g[k..k + 2] with k + 2 <= G.
+            unsafe {
+                let m = _mm_set1_epi64x(mask as i64);
+                let e = _mm_set1_epi64x(expected as i64);
+                // Every 32-bit half equal means every 64-bit lane is.
+                let mut eq = _mm_set1_epi32(-1);
+                let mut k = 0;
+                while k < G {
+                    let v = _mm_loadu_si128(g.as_ptr().add(k).cast());
+                    eq = _mm_and_si128(eq, _mm_cmpeq_epi32(_mm_and_si128(v, m), e));
+                    k += 2;
+                }
+                return _mm_movemask_epi8(eq) == 0xFFFF;
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if G % 2 == 0 {
+            use core::arch::aarch64::*;
+            // SAFETY: NEON is enabled. Each load reads g[k..k + 2] with
+            // k + 2 <= G.
+            unsafe {
+                let m = vdupq_n_u64(mask);
+                let e = vdupq_n_u64(expected);
+                let mut diff = vdupq_n_u64(0);
+                let mut k = 0;
+                while k < G {
+                    let v = vld1q_u64(g.as_ptr().add(k));
+                    diff = vorrq_u64(diff, veorq_u64(vandq_u64(v, m), e));
+                    k += 2;
+                }
+                return vmaxvq_u32(vreinterpretq_u32_u64(diff)) == 0;
+            }
+        }
+        g.iter().fold(0, |acc, v| acc | ((v & mask) ^ expected)) == 0
+    }
+
+    /// True if `v & mask == expected` for at least one value in the group.
+    #[inline(always)]
+    pub(super) fn any_eq<const G: usize>(g: &[u64; G], mask: u64, expected: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if G % 2 == 0 {
+            use core::arch::x86_64::*;
+            // SAFETY: as in all_eq.
+            unsafe {
+                if mask >> 32 == 0 && G % 4 == 0 {
+                    // Only the low halves can differ: pack the low halves
+                    // of four lanes into one vector and compare once.
+                    if expected >> 32 != 0 {
+                        return false;
+                    }
+                    let m = _mm_set1_epi32(mask as i32);
+                    let e = _mm_set1_epi32(expected as i32);
+                    let mut hit = _mm_setzero_si128();
+                    let mut k = 0;
+                    while k < G {
+                        let a = _mm_castsi128_ps(_mm_loadu_si128(g.as_ptr().add(k).cast()));
+                        let b = _mm_castsi128_ps(_mm_loadu_si128(g.as_ptr().add(k + 2).cast()));
+                        let lo = _mm_castps_si128(_mm_shuffle_ps::<0b10_00_10_00>(a, b));
+                        hit = _mm_or_si128(hit, _mm_cmpeq_epi32(_mm_and_si128(lo, m), e));
+                        k += 4;
+                    }
+                    return _mm_movemask_epi8(hit) != 0;
+                }
+                let m = _mm_set1_epi64x(mask as i64);
+                let e = _mm_set1_epi64x(expected as i64);
+                let mut hit = _mm_setzero_si128();
+                let mut k = 0;
+                while k < G {
+                    let v = _mm_loadu_si128(g.as_ptr().add(k).cast());
+                    // SSE2 has no 64-bit compare: a lane is equal when both
+                    // of its 32-bit halves are.
+                    let eq = _mm_cmpeq_epi32(_mm_and_si128(v, m), e);
+                    hit = _mm_or_si128(hit, _mm_and_si128(eq, _mm_shuffle_epi32::<0b10_11_00_01>(eq)));
+                    k += 2;
+                }
+                return _mm_movemask_epi8(hit) != 0;
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if G % 2 == 0 {
+            use core::arch::aarch64::*;
+            // SAFETY: as in all_eq.
+            unsafe {
+                let m = vdupq_n_u64(mask);
+                let e = vdupq_n_u64(expected);
+                let mut hit = vdupq_n_u64(0);
+                let mut k = 0;
+                while k < G {
+                    let v = vld1q_u64(g.as_ptr().add(k));
+                    hit = vorrq_u64(hit, vceqq_u64(vandq_u64(v, m), e));
+                    k += 2;
+                }
+                return vmaxvq_u32(vreinterpretq_u32_u64(hit)) != 0;
+            }
+        }
+        g.iter().fold(false, |acc, v| acc | (v & mask == expected))
+    }
+}
+
 impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     const MASK_VALUE: u64 = MASK;
 
@@ -3294,7 +3422,9 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// Asserts that at least group_len values are available.
     #[inline(always)]
     fn load(values: &[T], i: usize) -> [u64; G] {
-        let group = &values[i..i + G];
+        // Sliced as `[i..][..G]` so the length check is the same
+        // `len - i >= G` that group scans loop on, and folds into it.
+        let group = &values[i..][..G];
         core::array::from_fn(|j| group[j].to_bits())
     }
 
@@ -3348,7 +3478,7 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// outside the mask, use `eqlExact` instead.
     #[inline(always)]
     pub fn eql(values: &[T], i: usize, expected: u64) -> bool {
-        Self::load(values, i).iter().all(|v| v & Self::MASK_VALUE == expected)
+        group::all_eq(&Self::load(values, i), Self::MASK_VALUE, expected)
     }
 
     /// Scalar variant of `eql` for a single value.
@@ -3365,7 +3495,7 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// encounters a sentinel codepoint anywhere in the group.
     #[inline(always)]
     pub fn eql_any(values: &[T], i: usize, expected: u64) -> bool {
-        Self::load(values, i).iter().any(|v| v & Self::MASK_VALUE == expected)
+        group::any_eq(&Self::load(values, i), Self::MASK_VALUE, expected)
     }
 
     /// Like `eql` but returns the number of leading values whose
@@ -3415,7 +3545,7 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     /// correct and cheap.
     #[inline(always)]
     pub fn eql_exact(values: &[T], i: usize, expected: u64) -> bool {
-        Self::load(values, i).iter().all(|&v| v == expected)
+        group::all_eq(&Self::load(values, i), u64::MAX, expected)
     }
 }
 
@@ -3605,6 +3735,48 @@ mod tests {
         }
 
         assert_eq!(M::GROUP_LEN, 4);
+    }
+
+    /// The SIMD group compares must agree with the per-value definition for
+    /// every mix of lanes: a mask spanning both 32-bit halves (M1), one in the
+    /// low half only (M2, which takes the packed `eql_any` path on x86_64),
+    /// and the whole value (`eql_exact`).
+    #[test]
+    fn mask_group_compares_match_scalar() {
+        fn check<const MASK: u64>(cells: &[Cell], expected: u64) {
+            type G<const MASK: u64> = Mask<Cell, MASK, 4>;
+            let pick = |n: usize| -> [Cell; 4] { core::array::from_fn(|i| cells[(n >> (2 * i)) & 3]) };
+            for n in 0..256 {
+                let group = pick(n);
+                let hits = group.map(|c| G::<MASK>::pattern(c) == expected);
+                assert_eq!(hits.iter().all(|&h| h), G::<MASK>::eql(&group, 0, expected));
+                assert_eq!(hits.iter().any(|&h| h), G::<MASK>::eql_any(&group, 0, expected));
+                let exact = group.map(|c| c.to_bits() == expected);
+                assert_eq!(exact.iter().all(|&h| h), G::<MASK>::eql_exact(&group, 0, expected));
+            }
+        }
+
+        let a = Cell::init('A' as u32);
+        let mut a_styled = a;
+        a_styled.set_style_id(5);
+        let mut b_styled = Cell::init('B' as u32);
+        b_styled.set_style_id(5);
+        let mut b_other = b_styled;
+        b_other.set_style_id(0x8001);
+        let cells = [a, a_styled, b_styled, b_other];
+
+        const M1_MASK: u64 = field_mask(&[cell_fields::CONTENT_TAG, cell_fields::STYLE_ID]);
+        const M2_MASK: u64 = field_mask(&[cell_fields::CONTENT_CODEPOINT_DATA]);
+        assert!(M1_MASK >> 32 != 0 && M1_MASK as u32 != 0);
+        assert!(M2_MASK >> 32 == 0);
+
+        for &c in &cells {
+            check::<M1_MASK>(&cells, M1::pattern(c));
+            check::<M2_MASK>(&cells, M2::pattern(c));
+            check::<M1_MASK>(&cells, c.to_bits());
+        }
+        // An expected value with bits outside a low-half mask never matches.
+        check::<M2_MASK>(&cells, M2::pattern(a) | 1 << 40);
     }
 
     #[test]
@@ -4212,6 +4384,66 @@ mod tests {
         let dst_row = row(dst, 0);
         let src_row = row(src, 0);
         unsafe { dst.clone_row_from(src, dst_row, src_row) }
+    }
+
+    /// Runs of one style across pages reuse the last mapping (see
+    /// `last_style`), so ids and reference counts must come out as if every
+    /// cell had gone through addWithId.
+    #[test]
+    fn page_clone_row_from_style_runs_remap_ids_and_release_references() {
+        let mut src = init(cap3(10, 1, 8));
+        let mut dst = init(src.capacity);
+        let mut italic = Style::default();
+        italic.flags.italic = true;
+        let mut underline = Style::default();
+        underline.flags.underline = crate::terminal::sgr::Underline::Single;
+
+        let (src_mem, dst_mem) = (src.memory, dst.memory);
+        let a = unsafe { src.styles.add(src_mem, bold()) }.unwrap();
+        let b = unsafe { src.styles.add(src_mem, italic) }.unwrap();
+        // The destination already holds bold under a different id, so runs
+        // of `a` map to `existing` instead of keeping their id.
+        let unrelated = unsafe { dst.styles.add(dst_mem, underline) }.unwrap();
+        let existing = unsafe { dst.styles.add(dst_mem, bold()) }.unwrap();
+        assert!(a != existing);
+        let refs = |page: &Page, id| unsafe { page.styles.ref_count(page.memory, id) };
+
+        let ids = [Some(a), Some(a), None, Some(a), Some(b), Some(b), Some(a), None, Some(b), Some(b)];
+        for (x, maybe_id) in ids.iter().enumerate() {
+            let (row, cell) = rac(&src, x, 0);
+            *cell = cp_cell('a' as u32 + x as u32);
+            if let Some(id) = *maybe_id {
+                unsafe { src.styles.use_(src.memory, id) };
+                cell.set_style_id(id);
+                row.set_styled(true);
+            }
+        }
+
+        for _ in 0..2 {
+            clone_row_0(&mut dst, &src).unwrap();
+            assert_eq!(5, refs(&dst, existing));
+            assert_eq!(1, refs(&dst, unrelated));
+            for (x, maybe_id) in ids.iter().enumerate() {
+                let cell = rac(&dst, x, 0).1;
+                assert_eq!('a' as u32 + x as u32, cell.content_codepoint());
+                match *maybe_id {
+                    Some(id) if id == a => assert_eq!(existing, cell.style_id()),
+                    Some(_) => {
+                        let style = unsafe { *dst.styles.get(dst.memory, cell.style_id()) };
+                        assert!(italic.eql(&style));
+                        assert_eq!(4, refs(&dst, cell.style_id()));
+                    }
+                    None => assert_eq!(style::DEFAULT_ID, cell.style_id()),
+                }
+            }
+        }
+        let cols = dst.size.cols as usize;
+        let dst_row = row(&dst, 0);
+        dst.clear_cells(dst_row, 0, cols);
+        assert_eq!(1, refs(&dst, existing));
+        assert_eq!(1, refs(&dst, unrelated));
+        assert_eq!(5, refs(&src, a));
+        assert_eq!(5, refs(&src, b));
     }
 
     #[test]
