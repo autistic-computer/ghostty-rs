@@ -987,6 +987,8 @@ impl<H: Handler> Stream<H> {
     }
 
     #[inline(always)]
+    // The printable-run scan only breaks out of its label on aarch64.
+    #[cfg_attr(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")), allow(unused_labels))]
     fn next_slice_capped<const UNTIL: bool>(
         &mut self,
         input: &[u8],
