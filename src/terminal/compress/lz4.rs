@@ -162,7 +162,8 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
             // Hash the next four bytes and replace the table entry
             // immediately. Hash collisions are expected, so equality is
             // checked below before accepting a saved position as a match.
-            let sequence = read_u32(input, ip);
+            // SAFETY: ip <= search_end = input.len() - 12.
+            let sequence = unsafe { load_u32(input, ip) };
             let hash = hash_sequence(sequence);
             let candidates = table[hash];
             remember_position(table, hash, ip);
@@ -177,13 +178,19 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
                 }
             };
 
-            if read_u32(input, match_pos) != sequence {
+            // SAFETY: candidates come from `candidate_position`, so they
+            // are below ip and their four bytes end before ip + 4.
+            if unsafe { load_u32(input, match_pos) } != sequence {
                 // The nearest candidate collided. Fall back to the older
                 // one, which must additionally match one byte beyond the
                 // minimum so collision-prone minimum-length matches from
                 // the stale half are not emitted.
                 let older = candidate_position(ip, (candidates >> 16) as u16).filter(|&older| {
-                    read_u32(input, older) == sequence && input[older + MIN_MATCH] == input[ip + MIN_MATCH]
+                    // SAFETY: older < ip and ip + MIN_MATCH < input.len().
+                    unsafe {
+                        load_u32(input, older) == sequence
+                            && load_u8(input, older + MIN_MATCH) == load_u8(input, ip + MIN_MATCH)
+                    }
                 });
                 match older {
                     Some(older) => match_pos = older,
@@ -198,7 +205,8 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
             // particularly helpful around aligned cell records. As with
             // forward extension, compare words before locating the first
             // differing byte.
-            let (position, candidate) = match_begin(input, ip, match_pos, anchor);
+            // SAFETY: anchor <= ip <= search_end and match_pos < ip.
+            let (position, candidate) = unsafe { match_begin(input, ip, match_pos, anchor) };
             ip = position;
             match_pos = candidate;
 
@@ -206,12 +214,15 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
             // point where the required last five literals begin. `matchEnd`
             // compares a machine word at a time before locating the first
             // differing byte.
-            let match_end = match_end(input, ip + MIN_MATCH, match_pos + MIN_MATCH, match_end_limit);
+            // SAFETY: match_pos < ip, ip + MIN_MATCH <= match_end_limit and
+            // match_end_limit < input.len().
+            let match_end = unsafe { match_end(input, ip + MIN_MATCH, match_pos + MIN_MATCH, match_end_limit) };
 
             emit_sequence(
                 output,
                 &mut op,
-                &input[anchor..ip],
+                // SAFETY: anchor <= ip <= input.len().
+                unsafe { input.get_unchecked(anchor..ip) },
                 (ip - match_pos) as u16,
                 match_end - ip,
             )?;
@@ -223,7 +234,8 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
             // normally.
             if match_end >= 2 && match_end - 2 + MIN_MATCH <= input.len() {
                 let seed = match_end - 2;
-                remember_position(table, hash_sequence(read_u32(input, seed)), seed);
+                // SAFETY: seed + MIN_MATCH <= input.len() was checked above.
+                remember_position(table, hash_sequence(unsafe { load_u32(input, seed) }), seed);
             }
 
             ip = match_end;
@@ -384,28 +396,77 @@ fn emit_sequence(
         return Err(CompressError::OutputTooSmall);
     }
 
+    // Everything below writes inside output[*op..*op + required], which the
+    // check above showed is in bounds, so the stores skip their own checks.
+    // Zig's ReleaseFast build has none either; this is the encoder's hot path.
+    let out = output.as_mut_ptr();
     let token_pos = *op;
     *op += 1;
 
     // Lengths below 15 fit directly in their nibble. Larger values put 15 in
     // the nibble and encode the remainder immediately after the token.
-    output[token_pos] = ((literals.len().min(15) as u8) << 4) | (encoded_match_len.min(15) as u8);
+    // SAFETY: token_pos < *op + required (see above).
+    unsafe { *out.add(token_pos) = ((literals.len().min(15) as u8) << 4) | (encoded_match_len.min(15) as u8) };
 
     // Literal length extensions precede the literals they describe.
     if literals.len() >= 15 {
         write_length(output, op, literals.len() - 15);
     }
-    output[*op..*op + literals.len()].copy_from_slice(literals);
-    *op += literals.len();
+    // SAFETY: the literals and the offset fit in the checked range, and the
+    // input and output buffers don't overlap (see `compress`).
+    unsafe {
+        copy_literals(literals, out.add(*op));
+        *op += literals.len();
 
-    // Match length extensions follow the offset because this is where the
-    // decoder expects them in an LZ4 sequence.
-    write_u16(output, *op, offset);
+        // Match length extensions follow the offset because this is where the
+        // decoder expects them in an LZ4 sequence.
+        out.add(*op).cast::<[u8; 2]>().write_unaligned(offset.to_le_bytes());
+    }
     *op += 2;
     if encoded_match_len >= 15 {
         write_length(output, op, encoded_match_len - 15);
     }
     Ok(())
+}
+
+/// Copy a literal run to `dst`, writing exactly `literals.len()` bytes.
+///
+/// Most runs between matches in a page are a few bytes long, so short runs
+/// are copied inline with two possibly overlapping word stores instead of a
+/// `memcpy` call, which also spared the encoder loop the register spills
+/// around the call. Nothing past the run is written: the caller only clears
+/// the scratch prefix the encoding reports.
+///
+/// # Safety
+///
+/// `dst` is valid for `literals.len()` bytes and doesn't overlap `literals`.
+#[inline(always)]
+unsafe fn copy_literals(literals: &[u8], dst: *mut u8) {
+    let len = literals.len();
+    let src = literals.as_ptr();
+    // SAFETY: every load and store below lies within the first `len` bytes
+    // of `src` and `dst`.
+    unsafe {
+        if len >= 8 {
+            if len <= 16 {
+                let head = src.cast::<[u8; 8]>().read_unaligned();
+                let tail = src.add(len - 8).cast::<[u8; 8]>().read_unaligned();
+                dst.cast::<[u8; 8]>().write_unaligned(head);
+                dst.add(len - 8).cast::<[u8; 8]>().write_unaligned(tail);
+            } else {
+                core::ptr::copy_nonoverlapping(src, dst, len);
+            }
+        } else if len >= 4 {
+            let head = src.cast::<[u8; 4]>().read_unaligned();
+            let tail = src.add(len - 4).cast::<[u8; 4]>().read_unaligned();
+            dst.cast::<[u8; 4]>().write_unaligned(head);
+            dst.add(len - 4).cast::<[u8; 4]>().write_unaligned(tail);
+        } else {
+            for i in 0..len {
+                *dst.add(i) = *src.add(i);
+            }
+        }
+    }
 }
 
 /// Emit the literal-only sequence which terminates every block.
@@ -500,6 +561,38 @@ fn read_u128(input: &[u8], position: usize) -> u128 {
     u128::from_le_bytes(input[position..position + 16].try_into().unwrap())
 }
 
+// Unchecked reads for the encoder's hot loop. Zig's ReleaseFast build has no
+// bounds checks, and here they made up a large share of the encoder's
+// instructions. Every caller states why its read is in bounds; debug builds
+// check it.
+
+/// # Safety
+///
+/// `position < input.len()`.
+#[inline(always)]
+unsafe fn load_u8(input: &[u8], position: usize) -> u8 {
+    debug_assert!(position < input.len());
+    unsafe { *input.as_ptr().add(position) }
+}
+
+/// # Safety
+///
+/// `position + 4 <= input.len()`.
+#[inline(always)]
+unsafe fn load_u32(input: &[u8], position: usize) -> u32 {
+    debug_assert!(position <= input.len() && input.len() - position >= 4);
+    u32::from_le_bytes(unsafe { input.as_ptr().add(position).cast::<[u8; 4]>().read_unaligned() })
+}
+
+/// # Safety
+///
+/// `position + 8 <= input.len()`.
+#[inline(always)]
+unsafe fn load_u64(input: &[u8], position: usize) -> u64 {
+    debug_assert!(position <= input.len() && input.len() - position >= 8);
+    u64::from_le_bytes(unsafe { input.as_ptr().add(position).cast::<[u8; 8]>().read_unaligned() })
+}
+
 #[inline(always)]
 fn write_u16(output: &mut [u8], position: usize, value: u16) {
     output[position..position + 2].copy_from_slice(&value.to_le_bytes());
@@ -560,43 +653,57 @@ fn advance_search(ip: &mut usize, anchor: usize, attempts: &mut usize) {
 
 /// Extend a match backwards without crossing the current literal anchor or the
 /// beginning of the candidate. The returned positions preserve their offset.
-fn match_begin(input: &[u8], position: usize, candidate: usize, anchor: usize) -> (usize, usize) {
+///
+/// # Safety
+///
+/// `anchor <= position <= input.len()` and `candidate < position`.
+unsafe fn match_begin(input: &[u8], position: usize, candidate: usize, anchor: usize) -> (usize, usize) {
+    debug_assert!(anchor <= position && position <= input.len() && candidate < position);
+
+    // The candidate trails by a fixed offset, so Zig's two bounds
+    // (`position > anchor`, `candidate > 0`) are one bound on `position`.
+    let offset = position - candidate;
+    let floor = anchor.max(offset);
     let mut position = position;
-    let mut candidate = candidate;
 
-    while (position - anchor).min(candidate) >= 8 {
-        let position_word = position - 8;
-        let candidate_word = candidate - 8;
-        let difference = read_u64(input, position_word) ^ read_u64(input, candidate_word);
+    while position >= floor + 8 {
+        let word = position - 8;
+        // SAFETY: both words end at or before `position`, and word >= offset.
+        let difference = unsafe { load_u64(input, word) ^ load_u64(input, word - offset) };
         if difference != 0 {
-            let equal_bytes = (difference.leading_zeros() / 8) as usize;
-            position -= equal_bytes;
-            candidate -= equal_bytes;
-            return (position, candidate);
+            position -= (difference.leading_zeros() / 8) as usize;
+            return (position, position - offset);
         }
-
-        position = position_word;
-        candidate = candidate_word;
+        position = word;
     }
 
-    while position > anchor && candidate > 0 && input[position - 1] == input[candidate - 1] {
+    // SAFETY: position > floor >= offset, so both indices are in bounds.
+    while position > floor && unsafe { load_u8(input, position - 1) == load_u8(input, position - 1 - offset) } {
         position -= 1;
-        candidate -= 1;
     }
-    (position, candidate)
+    (position, position - offset)
 }
 
 /// Return the first input position where two matching runs differ, or `limit`
 /// when they remain equal. Both positions are known to have matched through
 /// `min_match` before this is called.
-fn match_end(input: &[u8], position: usize, candidate: usize, limit: usize) -> usize {
+///
+/// # Safety
+///
+/// `candidate < position <= limit <= input.len()`.
+unsafe fn match_end(input: &[u8], position: usize, candidate: usize, limit: usize) -> usize {
+    debug_assert!(candidate < position && position <= limit && limit <= input.len());
     let mut position = position;
     let mut candidate = candidate;
 
     // Reading as little endian makes the least-significant differing bit map
-    // to the earliest byte in memory on every target.
-    while limit - position >= 8 {
-        let difference = read_u64(input, position) ^ read_u64(input, candidate);
+    // to the earliest byte in memory on every target. Bounding the word loop
+    // by its last start keeps one induction variable fewer than Zig's
+    // `limit - position >= 8`, with the same iterations.
+    let last_word = limit.wrapping_sub(8);
+    while limit >= 8 && position <= last_word {
+        // SAFETY: position + 8 <= limit and candidate < position.
+        let difference = unsafe { load_u64(input, position) ^ load_u64(input, candidate) };
         if difference != 0 {
             let equal_bytes = (difference.trailing_zeros() / 8) as usize;
             return position + equal_bytes;
@@ -606,7 +713,8 @@ fn match_end(input: &[u8], position: usize, candidate: usize, limit: usize) -> u
         candidate += 8;
     }
 
-    while position < limit && input[position] == input[candidate] {
+    // SAFETY: candidate < position < limit.
+    while position < limit && unsafe { load_u8(input, position) == load_u8(input, candidate) } {
         position += 1;
         candidate += 1;
     }
