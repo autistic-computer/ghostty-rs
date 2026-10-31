@@ -446,6 +446,23 @@ pub struct VtFormatter<'a> {
 
 impl fmt::Display for VtFormatter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buf = [0u8; VtFormatter::MAX_LEN];
+        let len = self.encode(&mut buf);
+
+        // SAFETY-free: all bytes written are ASCII.
+        f.write_str(core::str::from_utf8(&buf[..len]).map_err(|_| fmt::Error)?)
+    }
+}
+
+impl VtFormatter<'_> {
+    /// The most bytes `encode` writes.
+    pub const MAX_LEN: usize = 128;
+
+    /// Writes the style's sequences into buf, returning the length. Rust
+    /// callers on a hot path write these bytes directly instead of going
+    /// through `Display`, which costs a format-machinery round trip and a
+    /// UTF-8 check per style.
+    pub fn encode(&self, buf: &mut [u8; VtFormatter::MAX_LEN]) -> usize {
         // Style emission is a hot path when formatting styled terminal
         // contents, so all of the sequences are assembled in a buffer
         // and written in one call rather than going through the
@@ -453,7 +470,6 @@ impl fmt::Display for VtFormatter<'_> {
         //
         // Worst case: `\x1b[0m` (4) + 7 flags (28) + `\x1b[53m` (5) +
         // `\x1b[4:2m` (6) + 3 RGB colors (19 each = 57) = 100.
-        let mut buf = [0u8; 128];
 
         // Always reset the style. Styles are fully self-contained.
         // Even if this style is empty, then that means we want to go
@@ -470,49 +486,44 @@ impl fmt::Display for VtFormatter<'_> {
 
         // Our flags
         if flags.bold {
-            put(&mut buf, &mut len, b"\x1b[1m");
+            put(buf, &mut len, b"\x1b[1m");
         }
         if flags.faint {
-            put(&mut buf, &mut len, b"\x1b[2m");
+            put(buf, &mut len, b"\x1b[2m");
         }
         if flags.italic {
-            put(&mut buf, &mut len, b"\x1b[3m");
+            put(buf, &mut len, b"\x1b[3m");
         }
         if flags.blink {
-            put(&mut buf, &mut len, b"\x1b[5m");
+            put(buf, &mut len, b"\x1b[5m");
         }
         if flags.inverse {
-            put(&mut buf, &mut len, b"\x1b[7m");
+            put(buf, &mut len, b"\x1b[7m");
         }
         if flags.invisible {
-            put(&mut buf, &mut len, b"\x1b[8m");
+            put(buf, &mut len, b"\x1b[8m");
         }
         if flags.strikethrough {
-            put(&mut buf, &mut len, b"\x1b[9m");
+            put(buf, &mut len, b"\x1b[9m");
         }
         if flags.overline {
-            put(&mut buf, &mut len, b"\x1b[53m");
+            put(buf, &mut len, b"\x1b[53m");
         }
         match flags.underline {
             sgr::Underline::None => {}
-            sgr::Underline::Single => put(&mut buf, &mut len, b"\x1b[4m"),
-            sgr::Underline::Double => put(&mut buf, &mut len, b"\x1b[4:2m"),
-            sgr::Underline::Curly => put(&mut buf, &mut len, b"\x1b[4:3m"),
-            sgr::Underline::Dotted => put(&mut buf, &mut len, b"\x1b[4:4m"),
-            sgr::Underline::Dashed => put(&mut buf, &mut len, b"\x1b[4:5m"),
+            sgr::Underline::Single => put(buf, &mut len, b"\x1b[4m"),
+            sgr::Underline::Double => put(buf, &mut len, b"\x1b[4:2m"),
+            sgr::Underline::Curly => put(buf, &mut len, b"\x1b[4:3m"),
+            sgr::Underline::Dotted => put(buf, &mut len, b"\x1b[4:4m"),
+            sgr::Underline::Dashed => put(buf, &mut len, b"\x1b[4:5m"),
         }
 
         // Various colors.
         len += self.append_color(&mut buf[len..], 38, self.style.fg_color);
         len += self.append_color(&mut buf[len..], 48, self.style.bg_color);
         len += self.append_color(&mut buf[len..], 58, self.style.underline_color);
-
-        // SAFETY-free: all bytes written are ASCII.
-        f.write_str(core::str::from_utf8(&buf[..len]).map_err(|_| fmt::Error)?)
+        len
     }
-}
-
-impl VtFormatter<'_> {
     /// Appends a standalone `\x1b[{prefix};5;{idx}m` or
     /// `\x1b[{prefix};2;{r};{g};{b}m` sequence to buf, returning the
     /// length written.
