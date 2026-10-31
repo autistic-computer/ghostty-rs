@@ -132,6 +132,9 @@ pub fn compress_bound(input_len: usize) -> Result<usize, CompressError> {
 /// Returns the initialized length of `output`. The input and output buffers
 /// must not overlap. `table` is scratch space and does not need to be
 /// initialized by the caller; it is reset before use.
+// Kept out of line: inlined into PageList::compressPage the encoder loop
+// shared registers with the caller and spilled its bounds to the stack.
+#[inline(never)]
 pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Result<usize, CompressError> {
     if input.len() > MAX_INPUT_SIZE {
         return Err(CompressError::InputTooLarge);
