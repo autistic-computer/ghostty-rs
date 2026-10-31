@@ -21,7 +21,7 @@ mirrored snake_case path, names follow the Zig ones, and tests are ported alongs
 | `tools/zig_reference.sh ZZ_CHECKOUT` | Builds zz's Zig libghostty-vt into `target/zig-reference` (needs zz's pinned Zig) |
 | `test/differential/run.sh target/zig-reference` | Replays one operation log through both engines at 13 write-chunk sizes; every snapshot must match |
 | `test/differential/fuzz.py target/zig-reference --time 3600` | Random operation logs (`generate.py --seed`) through both engines on half the cores; mismatches, crashes and hangs land in `target/fuzz/failures/` (`--seeds A:B`, `--jobs N`, `--checked` for a Rust build with debug assertions) |
-| `test/differential/fuzz.py target/zig-reference --minimize SEED_OR_CASE` | Shrinks a failing case while it fails the same way, then prints it and the first differing value; `--replay` only runs it, `--show CASE` prints a log |
+| `test/differential/fuzz.py target/zig-reference --minimize SEED_OR_CASE` | Shrinks a failing case while it fails the same way, then prints it and the first differing value (`--timeout S` for hangs); `--replay` only runs it, `--show CASE` prints a log |
 | `bench/run.sh target/zig-reference` | Times zz's hot paths through the C API on both engines (`--only`, `--runs`, `--json`); a ratio above 1 means Rust is slower |
 
 The repo's `.cargo/config.toml` limits builds to two jobs for a small box; set

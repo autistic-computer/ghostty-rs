@@ -21,6 +21,11 @@ crash-both: a bug the port shares with upstream, not a port difference.
 differing lines of a value trace (compare.c's DIFF_TRACE). --minimize drops
 ops and write bytes while the case still fails the same way, then replays the
 result. --show prints a log as Python literals.
+
+known/ keeps minimized cases of bugs the port shares with upstream, so
+both engines agree on them: upstream-viewport-pin-integrity.bin trips the
+page list integrity check in debug builds of either engine (--checked), and
+upstream-insert-lines-livelock.bin never finishes on either.
 """
 import concurrent.futures as cf, os, pathlib, random, re, shutil, signal, subprocess, sys, tempfile, time
 
@@ -182,8 +187,10 @@ def campaign(out, start, stop, seconds, jobs):
         say("interrupted")
     shutil.rmtree(work, ignore_errors=True)
     say("done: %d seeds (%d..%d) in %.0fs, %d failing seeds" % (total, start, nxt - 1, time.time() - t0, sum(map(len, seen.values()))))
-    for sig, seeds in sorted(seen.items(), key=lambda kv: -len(kv[1])):
-        say("  %6d  %s  e.g. seeds %s" % (len(seeds), sig, " ".join(map(str, seeds[:5]))))
+    with open(out / "failing-seeds.txt", "a") as f:
+        for sig, seeds in sorted(seen.items(), key=lambda kv: -len(kv[1])):
+            say("  %6d  %s  e.g. seeds %s" % (len(seeds), sig, " ".join(map(str, seeds[:5]))))
+            f.write("%s\t%s\n" % (sig, " ".join(map(str, sorted(seeds)))))
     return 1 if seen else 0
 
 
