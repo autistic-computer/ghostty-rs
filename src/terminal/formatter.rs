@@ -1575,34 +1575,28 @@ impl<'a> PageFormatter<'a> {
                         break 'fast;
                     }
 
-                    // Pages without hyperlinks take a copy of the run
-                    // loop that never checks for them.
-                    let track_points = self.point_map.is_some();
-                    let consumed = if format_styled(emit) && page_hyperlinks {
-                        self.write_cell_run::<EMIT, true>(
-                            track_points,
-                            writer,
-                            &mut run_buf,
-                            &cells_subset[cell_i..],
-                            x,
-                            y,
-                            style_id,
-                            current_hyperlink_id,
-                            &mut blank_cells,
-                        )?
-                    } else {
-                        self.write_cell_run::<EMIT, false>(
-                            track_points,
-                            writer,
-                            &mut run_buf,
-                            &cells_subset[cell_i..],
-                            x,
-                            y,
-                            style_id,
-                            current_hyperlink_id,
-                            &mut blank_cells,
-                        )?
-                    };
+                    // A text cell in another style ends the run before it
+                    // starts, so skip the call. (Zig calls writeCellRun,
+                    // which consumes nothing; that call was a measurable
+                    // share of styled output, made at every style change.)
+                    if format_styled(emit)
+                        && matches!(cell.wide(), Wide::Narrow | Wide::Wide)
+                        && cell.style_id() as u32 != style_id
+                    {
+                        break 'fast;
+                    }
+
+                    let consumed = self.write_run::<EMIT>(
+                        page_hyperlinks,
+                        writer,
+                        &mut run_buf,
+                        &cells_subset[cell_i..],
+                        x,
+                        y,
+                        style_id,
+                        current_hyperlink_id,
+                        &mut blank_cells,
+                    )?;
 
                     // Zero cells consumed means the first cell isn't
                     // eligible for the fast path; handle it below.
@@ -1828,6 +1822,31 @@ impl<'a> PageFormatter<'a> {
                     // We combine codepoint and graphemes because both have
                     // shared style handling. We use comptime to dup it.
                     tag @ (ContentTag::Codepoint | ContentTag::CodepointGrapheme) => {
+                        // The style and hyperlink are now this cell's and
+                        // no blanks are pending, so the fast path writes
+                        // this cell and the run after it. (Zig writes this
+                        // cell here and starts the run at the next one;
+                        // the bytes are the same, with one writer call
+                        // fewer per style change.)
+                        if cp_map_empty {
+                            debug_assert_eq!(blank_cells, 0);
+                            let consumed = self.write_run::<EMIT>(
+                                page_hyperlinks,
+                                writer,
+                                &mut run_buf,
+                                &cells_subset[cell_i..],
+                                x,
+                                y,
+                                style_id,
+                                current_hyperlink_id,
+                                &mut blank_cells,
+                            )?;
+                            if consumed > 0 {
+                                cell_i += consumed;
+                                continue 'cells;
+                            }
+                        }
+
                         self.write_cell(tag, emit, writer, cell)?;
 
                         // If we have a point map, all codepoints map to this
@@ -1911,6 +1930,50 @@ impl<'a> PageFormatter<'a> {
         })
     }
 
+    /// `write_cell_run` for the page: pages without hyperlinks take a copy
+    /// of the run loop that never checks for them.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn write_run<const EMIT: u8>(
+        &mut self,
+        page_hyperlinks: bool,
+        writer: &mut dyn Write,
+        buf: &mut [u8; RUN_BUF_LEN],
+        cells: &[Cell],
+        run_x: CellCountInt,
+        run_y: CellCountInt,
+        run_style_id: u32,
+        run_hyperlink_id: Option<hyperlink::Id>,
+        blank_cells: &mut usize,
+    ) -> io::Result<usize> {
+        let track_points = self.point_map.is_some();
+        if format_styled(emit_format::<EMIT>()) && page_hyperlinks {
+            self.write_cell_run::<EMIT, true>(
+                track_points,
+                writer,
+                buf,
+                cells,
+                run_x,
+                run_y,
+                run_style_id,
+                run_hyperlink_id,
+                blank_cells,
+            )
+        } else {
+            self.write_cell_run::<EMIT, false>(
+                track_points,
+                writer,
+                buf,
+                cells,
+                run_x,
+                run_y,
+                run_style_id,
+                run_hyperlink_id,
+                blank_cells,
+            )
+        }
+    }
+
     /// Fast path for writing runs of simple cells: single-codepoint cells
     /// that require no style or hyperlink handling. Output bytes are
     /// batched into a stack buffer to avoid per-cell writer dispatch.
@@ -1959,8 +2022,39 @@ impl<'a> PageFormatter<'a> {
         let mut len: usize = 0;
         let mut pending: usize = *blank_cells;
 
+        // The ASCII lane below takes narrow single-codepoint cells in the
+        // run's style holding printable ASCII, which encode to their own
+        // byte in plain and VT output. It is a departure from Zig, which
+        // runs every cell through the full loop body; the lane skips the
+        // blank, hyperlink, flush and point map bookkeeping those cells
+        // don't need, about half the per-cell work of plain text. Spaces
+        // are blanks in plain output with trimming, so they stay out then.
+        let ascii_lane = matches!(emit, Format::Plain | Format::Vt) && !hyperlinks && !track_points;
+        let ascii_lo: u32 = if emit == Format::Plain && self.opts.trim { 0x21 } else { 0x20 };
+
         let mut i: usize = 0;
         while i < cells.len() {
+            if ascii_lane && pending == 0 {
+                let end = i + (cells.len() - i).min(buf.len() - len);
+                while i < end {
+                    let cell = &cells[i];
+                    let cp = cell.content_codepoint();
+                    let simple = cell.wide() == Wide::Narrow
+                        && cell.content_tag() == ContentTag::Codepoint
+                        && (!format_styled(emit) || cell.style_id() as u32 == run_style_id)
+                        && (ascii_lo..0x7F).contains(&cp);
+                    if !simple {
+                        break;
+                    }
+                    buf[len] = cp as u8;
+                    len += 1;
+                    i += 1;
+                }
+                if i == cells.len() {
+                    break;
+                }
+            }
+
             let cell = &cells[i];
 
             // Spacers produce no output, matching the slow path which
@@ -2448,7 +2542,22 @@ fn encode_codepoint<const N: usize>(emit: Format, buf: &mut [u8; N], len: &mut u
 #[inline(always)]
 fn style_is_default(s: &Style) -> bool {
     let none = |c: style::Color| matches!(c, style::Color::None);
-    s.flags == style::Flags::default() && none(s.fg_color) && none(s.bg_color) && none(s.underline_color)
+    // A pattern rather than `==`, whose derived impl isn't inlined.
+    let plain_flags = matches!(
+        s.flags,
+        style::Flags {
+            bold: false,
+            italic: false,
+            faint: false,
+            blink: false,
+            inverse: false,
+            invisible: false,
+            strikethrough: false,
+            overline: false,
+            underline: crate::terminal::sgr::Underline::None,
+        }
+    );
+    plain_flags && none(s.fg_color) && none(s.bg_color) && none(s.underline_color)
 }
 
 /// Whether any of the cells only carries a background color.
@@ -5243,6 +5352,52 @@ mod tests {
                 Format::Plain => assert_eq!(format!("ae{marks} b"), fast),
                 Format::Vt => assert_eq!(format!("a\x1b[0m\x1b[38;5;1me{marks}\x1b[0m b"), fast),
                 Format::Html => assert!(fast.contains(&format!("e{}", "&#769;".repeat(40))), "{fast}"),
+            }
+        }
+    }
+
+    #[test]
+    fn page_fast_paths_match_per_cell_path() {
+        // A codepoint map that matches nothing sends every cell through
+        // the per-cell path. The cell run fast path, its ASCII lane (only
+        // without a point map or hyperlinks) and the handoff from the
+        // per-cell path to the run must write the same bytes, point map
+        // and trailing state.
+        let plain_page = concat!(
+            "plain ascii text   \r\n",
+            "\x1b[31mred\x1b[0m \x1b[1;4mbold\x1b[0m  \x1b[38;2;1;2;3mrgb\x1b[0m end~\r\n",
+            "wide \u{6f22}\u{5b57} e\u{301} \x1b[32m\u{6f22}\x1b[0mx\x1b[7m \x1b[0m\r\n",
+            "\x1b[44m\x1b[K\x1b[0m\r\n",
+            "lead\x1b[45m    \x1b[0mtail <&>\"'\x7f\r\n",
+            "this line is long enough that it wraps around the edge\r\n",
+            "\r\n\r\n   indented \x1b[33m  \x1b[0m\r\n",
+        );
+        let link_page = concat!(
+            "\x1b]8;;https://a.example\x1b\\link\x1b]8;;\x1b\\ plain ",
+            "\x1b]8;id=x;https://b.example\x1b\\\x1b[31mtwo\x1b[0m words\x1b]8;;\x1b\\ end\r\n",
+            "after \x1b[1mbold\x1b[0m\r\n",
+        );
+        for input in [plain_page, link_page] {
+            let mut t = term(30, 12);
+            feed(&mut t, input);
+            let page = last_page(&t);
+            for emit in [Format::Plain, Format::Vt, Format::Html] {
+                for (trim, unwrap) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let mut o = opts(emit);
+                    o.trim = trim;
+                    o.unwrap = unwrap;
+                    let mut per_cell = o.clone();
+                    per_cell.codepoint_map =
+                        Some(vec![cp_map(['\u{E000}', '\u{E000}'], Replacement::Codepoint('x' as u32))]);
+                    let what = format!("{emit:?} trim={trim} unwrap={unwrap}");
+
+                    let want = fmt_page(page, per_cell, |_| {});
+                    let got = fmt_page(page, o.clone(), |_| {});
+                    assert_eq!(want.out, got.out, "{what}");
+                    assert_eq!(want.map, got.map, "{what}");
+                    assert_eq!(want.state, got.state, "{what}");
+                    assert_eq!(want.out, fmt_last_page_nomap(&t, o), "{what} without a point map");
+                }
             }
         }
     }
