@@ -330,16 +330,15 @@ impl Style {
     }
 }
 
-/// Zig `std.hash.int` for `u64`.
+/// Zig `std.hash.int` for `u64` (mx3 as of Zig 0.17).
 #[inline(always)]
 fn hash_int_u64(input: u64) -> u64 {
+    const C: u64 = 0xbea225f9eb34556d;
     let mut x = input;
-    x ^= x >> 32;
-    x = x.wrapping_mul(0xd6e8feb86659fd93);
-    x ^= x >> 32;
-    x = x.wrapping_mul(0xd6e8feb86659fd93);
-    x ^= x >> 32;
-    x
+    x = (x ^ (x >> 32)).wrapping_mul(C);
+    x = (x ^ (x >> 29)).wrapping_mul(C);
+    x = (x ^ (x >> 32)).wrapping_mul(C);
+    x ^ (x >> 29)
 }
 
 /// Formatting to make debug logs easier to read
@@ -753,6 +752,20 @@ pub type SetItem = ref_counted_set::Item<Style, Id, size::CellCountInt>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expected values are Zig 0.17's `std.hash.int` on `u64`, which
+    /// `Style.hash` uses, so the style set probes and grows the same way in
+    /// both. Found by test/differential/fuzz.py: with the older function,
+    /// pages full of distinct styles grew at different times, which moved
+    /// page boundaries and scrollback pruning, and once left a cell without
+    /// its hyperlink.
+    #[test]
+    fn hash_int_matches_zig() {
+        assert_eq!(hash_int_u64(0), 0);
+        assert_eq!(hash_int_u64(1), 0x071894de00d9981f);
+        assert_eq!(hash_int_u64(0x123456789abcdef0), 0x98e89f2a89515efe);
+        assert_eq!(hash_int_u64(u64::MAX), 0x96c7cbb7179e89f6);
+    }
     use crate::terminal::ref_counted_set::AddError;
     use crate::terminal::size::{AlignedBuf, OffsetBuf};
 
