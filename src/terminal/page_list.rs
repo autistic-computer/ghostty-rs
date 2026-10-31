@@ -33,7 +33,15 @@
 //! - The page pool is a local [`PagePool`] with the semantics of
 //!   `datastruct::UntouchedPool([std_size]u8)` because `std_size` is only
 //!   known at runtime in Rust (`Page::layout` is not a `const fn`). The
-//!   wasm page pool is not used (native targets only).
+//!   wasm page pool is not used (native targets only). Its live count is
+//!   a `Cell` because a copy-on-write `clone` of a `&PageList` disowns
+//!   pool items (Zig `@constCast`s the pool there).
+//! - Copy-on-write clones share resident history through
+//!   [`SharedResident`] and compressed history through the reference
+//!   count in `compress::Page`; both counts are atomic because a clone can
+//!   move to another thread. Shared memory is never written: `Node::page`
+//!   and the other mutable accessors detach first, and readers that must
+//!   not copy use `Node::page_read` / `Pin::row_and_cell_read`.
 //! - Explicit `deinit` became `Drop` for [`PageList`], [`MemoryPool`],
 //!   [`Builder`] and [`PageAllocation`] (they release their pages and
 //!   pins). [`PageAllocation`] keeps a raw pointer to its destination
@@ -48,7 +56,9 @@ use core::clone::Clone as _;
 use core::fmt;
 use core::ptr::NonNull;
 use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
+use std::cell::Cell as StdCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use indexmap::IndexSet;
@@ -74,7 +84,7 @@ const LOG_TARGET: &str = "page_list";
 /// The number of pages we preheat the page pool with. For operating systems
 /// that support it, pages are demand-paged (see PagePool) so this only
 /// costs us address space. For other operating systems, we don't preheat.
-const PAGE_PREHEAT: usize = 4;
+const PAGE_PREHEAT: usize = 1;
 
 /// The number of nodes we preheat the node pool with. Unlike pages, nodes
 /// are ordinary heap memory so every idle preheated node costs real
@@ -193,6 +203,33 @@ impl Allocator {
         }
         let layout = AllocLayout::from_size_align(len, align).unwrap();
         unsafe { self.dealloc(ptr.as_ptr(), layout) };
+    }
+
+    /// The backing allocator object, or None for the Rust global allocator.
+    #[inline]
+    pub fn backend(&self) -> Option<&'static (dyn GlobalAlloc + Sync)> {
+        self.backend
+    }
+
+    /// Allocate and initialize one `T` (Zig: `alloc.create(T)`).
+    pub fn create<T>(&self, value: T) -> Result<NonNull<T>, AllocError> {
+        let size = core::mem::size_of::<T>().max(1);
+        let ptr = self.alloc_bytes(size, core::mem::align_of::<T>())?.cast::<T>();
+        // SAFETY: fresh allocation sized and aligned for `T`.
+        unsafe { ptr.as_ptr().write(value) };
+        Ok(ptr)
+    }
+
+    /// Free a value from [`Allocator::create`] (Zig: `alloc.destroy`).
+    /// The value is not dropped.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must come from `create` on an equivalent allocator and not
+    /// be used afterwards.
+    pub unsafe fn destroy<T>(&self, ptr: NonNull<T>) {
+        let size = core::mem::size_of::<T>().max(1);
+        unsafe { self.free_bytes(ptr.cast::<u8>(), size, core::mem::align_of::<T>()) };
     }
 
     /// Model an allocation made by a container that uses Rust's global
@@ -340,19 +377,83 @@ pub struct Node {
     /// This has no default on purpose so that every construction site
     /// is forced to make an explicit decision.
     pub owned: Owned,
+
+    /// Whether trimLastPage decommitted the cells behind this page's
+    /// unused rows. They must be recommitted (see untrim) before anything
+    /// writes past the page's current size.
+    pub trimmed: bool,
+
+    /// The copy-on-write backing this resident page shares with clones
+    /// (see `clone` with `cow`). Writers detach first (see `detach`).
+    pub shared: Option<NonNull<SharedResident>>,
+
+    /// Whether this heap-owned page's memory is a page pool item that a
+    /// copy-on-write clone took out of the pool (see `PagePool::disown`).
+    /// Retiring the node can give it back to the pool (see retireNode).
+    pub pool_backing: bool,
 }
 
 crate::impl_intrusive_node!(Node);
 
+/// Resident page memory shared copy-on-write between nodes of different
+/// PageLists (Zig: `Node.SharedResident`).
+///
+/// The memory is immutable while more than one node references it. The
+/// reference count is atomic because a clone can move to another thread
+/// while its source keeps running.
+#[derive(Debug)]
+pub struct SharedResident {
+    pub references: AtomicUsize,
+
+    /// The whole backing allocation: a full pool item for pool-backed
+    /// pages, else the exact heap allocation.
+    pub memory: PageMemory,
+
+    /// Allocator of this value.
+    pub alloc: Allocator,
+
+    /// Allocator of `memory`, and of private copies made by `detach`.
+    pub page_alloc: Allocator,
+}
+
+impl SharedResident {
+    /// Drop one reference, freeing the memory and this value with the last.
+    ///
+    /// # Safety
+    ///
+    /// `this` must be live and the caller must own one of its references.
+    unsafe fn release(this: NonNull<SharedResident>) {
+        unsafe {
+            let shared = this.as_ref();
+            if shared.references.fetch_sub(1, Ordering::AcqRel) != 1 {
+                return;
+            }
+            shared
+                .page_alloc
+                .free_bytes(NonNull::new_unchecked(shared.memory.ptr()), shared.memory.len(), PAGE_SIZE_MIN);
+            let alloc = shared.alloc;
+            alloc.destroy(this);
+        }
+    }
+}
+
+/// Row and cell pointers for reading only (Zig: the result of
+/// `Pin.rowAndCellRead`).
+#[derive(Debug, Clone, Copy)]
+pub struct RowAndCellRead {
+    pub row: *const Row,
+    pub cell: *const pagepkg::Cell,
+}
+
 /// The physical representation of the page contents (Zig: `Node.Data`).
 ///
-/// Both states retain the same `Page.memory` virtual mapping and the same
-/// `Page` metadata. A resident page can access the mapping directly since
-/// it is, well, resident.
+/// Live compressed pages retain their raw mapping and `Page` metadata.
+/// Immutable clones keep metadata and encoded bytes with an empty raw
+/// memory slice until first access. Resident pages access their private
+/// or copy-on-write mapping directly.
 ///
-/// A compressed page owns an encoded copy while the physical memory
-/// behind the raw mapping is discarded. HOWEVER, we retain the
-/// virtual allocation so that restoration is infallible.
+/// Live compressed pages retain the virtual allocation while discarding
+/// physical memory, so their restoration needs no allocation.
 #[derive(Debug)]
 pub enum NodeData {
     Resident(Page),
@@ -433,6 +534,72 @@ enum RestoreMode {
 }
 
 impl Node {
+    /// A resident or compressed node with the given storage and no
+    /// copy-on-write or trim state (Zig: `.{ .data, .serial, .owned }`).
+    #[inline]
+    pub fn new(data: NodeData, serial: u64, owned: Owned) -> Node {
+        Node {
+            prev: None,
+            next: None,
+            data,
+            serial,
+            owned,
+            trimmed: false,
+            shared: None,
+            pool_backing: false,
+        }
+    }
+
+    /// Give this node private memory before a write: take the shared
+    /// backing over when this node holds its last reference, else copy it.
+    #[inline]
+    fn detach(&mut self) {
+        if self.shared.is_some() {
+            self.detach_slow();
+        }
+    }
+
+    #[inline(never)]
+    fn detach_slow(&mut self) {
+        let Some(shared) = self.shared else { return };
+        // SAFETY: this node holds a reference, so `shared` is live.
+        unsafe {
+            let backing = shared.as_ref();
+            if backing.references.load(Ordering::Acquire) == 1 {
+                self.shared = None;
+                let alloc = backing.alloc;
+                alloc.destroy(shared);
+                return;
+            }
+            let len = backing.memory.len();
+            let memory = match backing.page_alloc.alloc_bytes(len, PAGE_SIZE_MIN) {
+                Ok(ptr) => PageMemory::from_raw_parts(ptr.as_ptr(), len),
+                Err(_) => panic!("terminal copy-on-write allocation failed"),
+            };
+            let NodeData::Resident(page) = &mut self.data else {
+                unreachable!("shared pages are resident")
+            };
+            // The shared memory is immutable while shared, and the new
+            // allocation is private and at least as long.
+            *page = page.clone_buf(memory);
+            self.shared = None;
+            SharedResident::release(shared);
+        }
+    }
+
+    /// Return the terminal page for reading without detaching copy-on-write
+    /// memory. A compressed node is restored like `page`.
+    #[inline]
+    pub fn page_read(&mut self) -> &Page {
+        if let NodeData::Compressed(_) = self.data {
+            return self.restore(RestoreMode::Preserve);
+        }
+        match &self.data {
+            NodeData::Resident(p) => p,
+            NodeData::Compressed(_) => unreachable!(),
+        }
+    }
+
     /// Return the terminal page stored in this node.
     ///
     /// WARNING: This will DECOMPRESS compressed pages! Only use this if
@@ -440,6 +607,7 @@ impl Node {
     /// metadata (row, col counts etc) then use the other metadata functions.
     #[inline]
     pub fn page(&mut self) -> &mut Page {
+        self.detach();
         if let NodeData::Compressed(_) = self.data {
             return self.restore(RestoreMode::Preserve);
         }
@@ -454,6 +622,7 @@ impl Node {
     /// available.
     #[inline]
     pub fn page_if_resident(&mut self) -> Option<&mut Page> {
+        self.detach();
         match &mut self.data {
             NodeData::Resident(p) => Some(p),
             NodeData::Compressed(_) => None,
@@ -472,7 +641,7 @@ impl Node {
         match &self.data {
             NodeData::Resident(p) => Ok(PreservedPage::Borrowed(p as *const Page)),
             NodeData::Compressed(compressed) => {
-                let len = compressed.page.memory.len();
+                let len = compressed.raw_len;
                 let ptr = alloc.alloc_bytes(len, PAGE_SIZE_MIN)?;
                 // SAFETY: fresh allocation of `len` bytes.
                 let memory = unsafe { PageMemory::from_raw_parts(ptr.as_ptr(), len) };
@@ -513,6 +682,7 @@ impl Node {
     /// that invariant independently.
     #[inline]
     pub fn page_assume_resident(&mut self) -> &mut Page {
+        self.detach();
         match &mut self.data {
             NodeData::Resident(p) => p,
             NodeData::Compressed(_) => unreachable!("page is not resident"),
@@ -537,6 +707,33 @@ impl Node {
         self.metadata().capacity
     }
 
+    /// The logical length of the raw page memory, mapped or not.
+    #[inline]
+    pub fn raw_len(&self) -> usize {
+        match &self.data {
+            NodeData::Resident(p) => p.memory.len(),
+            NodeData::Compressed(c) => c.raw_len,
+        }
+    }
+
+    /// Release the encoding of a compressed clone that never mapped its
+    /// raw memory, returning the raw length it accounted for. Returns None
+    /// and does nothing for any other node. The node is left for the
+    /// caller to destroy.
+    fn discard_unmapped(&mut self) -> Option<usize> {
+        let compressed = match &mut self.data {
+            NodeData::Resident(_) => return None,
+            NodeData::Compressed(c) => c,
+        };
+        if compressed.page.memory.len() != 0 {
+            return None;
+        }
+        assert!(self.owned == Owned::Heap);
+        let raw_len = compressed.raw_len;
+        compressed.deinit();
+        Some(raw_len)
+    }
+
     /// Return the embedded Page metadata without restoring its memory.
     #[inline]
     pub fn metadata(&self) -> &Page {
@@ -550,7 +747,7 @@ impl Node {
     ///
     /// Preserve mode reconstructs the page contents and is used by `page`.
     /// Discard mode skips decoding for callers which will overwrite or destroy
-    /// the page. Both modes recommit the retained mapping, free the encoded
+    /// the page. Both modes prepare a private mapping, free the encoded
     /// allocation, and leave the node in a valid resident state.
     #[inline(never)]
     fn restore(&mut self, mode: RestoreMode) -> &mut Page {
@@ -559,10 +756,22 @@ impl Node {
             NodeData::Compressed(c) => c,
         };
 
-        // Decommit only discarded the physical pages. Recommit prepares the
-        // still-reserved mapping for decoding or reuse by the caller.
-        // SAFETY: the retained mapping is owned by this node.
-        terminal_mem::recommit(unsafe { compressed.page.memory.as_mut_slice() });
+        // A lazy clone needs a private mapping; live compressed pages reuse
+        // their retained range for decoding or overwriting by the caller.
+        if compressed.page.memory.len() == 0 {
+            let page_alloc = compressed.mapping_alloc.expect("unmapped compressed page has a mapping allocator");
+            let len = compressed.raw_len;
+            compressed.page.memory = match page_alloc.alloc_bytes(len, PAGE_SIZE_MIN) {
+                // SAFETY: fresh, page-aligned allocation of `len` bytes.
+                Ok(ptr) => unsafe { PageMemory::from_raw_parts(ptr.as_ptr(), len) },
+                Err(_) => panic!("terminal copy-on-write allocation failed"),
+            };
+        } else {
+            // Decommit only discarded the physical pages. Recommit prepares
+            // the still-reserved mapping for decoding or reuse by the caller.
+            // SAFETY: the retained mapping is owned by this node.
+            terminal_mem::recommit(unsafe { compressed.page.memory.as_mut_slice() });
+        }
 
         let restored = match mode {
             RestoreMode::Preserve => match compressed.restore() {
@@ -645,8 +854,9 @@ pub struct PagePool {
     free: Vec<PagePoolItemPtr>,
 
     /// Number of items currently allocated from the item allocator,
-    /// free or in use.
-    live: usize,
+    /// free or in use. A cell because a copy-on-write `clone` of a
+    /// `&PageList` disowns items (Zig `@constCast`s the pool there).
+    live: StdCell<usize>,
 }
 
 impl PagePool {
@@ -670,7 +880,7 @@ impl PagePool {
         let mut pool = PagePool {
             allocator: item_alloc,
             free,
-            live: 0,
+            live: StdCell::new(0),
         };
         for _ in 0..preheat {
             let item = pool.alloc_item()?;
@@ -682,7 +892,7 @@ impl PagePool {
     /// Free items so that the retained free items fit `mode`. Every
     /// item must have been returned with destroy() or release().
     pub fn reset(&mut self, mode: ResetMode) -> bool {
-        debug_assert_eq!(self.live, self.free.len());
+        debug_assert_eq!(self.live.get(), self.free.len());
         let retain_bytes: usize = match mode {
             ResetMode::FreeAll => 0,
             ResetMode::RetainCapacity => return true,
@@ -694,7 +904,7 @@ impl PagePool {
             let item = self.free.pop().unwrap();
             // SAFETY: free items were allocated from `allocator` with layout().
             unsafe { self.allocator.dealloc(item.as_ptr(), Self::layout()) };
-            self.live -= 1;
+            self.live.set(self.live.get() - 1);
         }
         true
     }
@@ -702,6 +912,12 @@ impl PagePool {
     /// Return the number of items that are allocated but not in use.
     pub fn free_count(&self) -> usize {
         self.free.len()
+    }
+
+    /// Return the number of items allocated from the item allocator, free
+    /// or in use (Zig: `live`).
+    pub fn live(&self) -> usize {
+        self.live.get()
     }
 
     /// Get an item. This pops a free item without touching it or,
@@ -713,36 +929,60 @@ impl PagePool {
 
         // Reserve the free-list slot for the new item before
         // allocating it so that destroy() can never fail.
-        let need = self.live + 1;
-        if self.free.capacity() < need {
-            self.free
-                .try_reserve(need - self.free.len())
-                .map_err(|_| AllocError::OutOfMemory)?;
-        }
+        self.reserve_free_slot()?;
         self.alloc_item()
     }
 
     /// Return an item to the free list for reuse. The item is not
     /// modified or zeroed so it is up to the caller.
     pub fn destroy(&mut self, item: PagePoolItemPtr) {
-        debug_assert!(self.free.len() < self.live);
+        debug_assert!(self.free.len() < self.live.get());
         self.free.push(item);
     }
 
     /// Return an item straight to the item allocator instead of the
     /// free list.
     pub fn release(&mut self, item: PagePoolItemPtr) {
-        debug_assert!(self.free.len() < self.live);
+        debug_assert!(self.free.len() < self.live.get());
         // SAFETY: live items were allocated from `allocator` with layout().
         unsafe { self.allocator.dealloc(item.as_ptr(), Self::layout()) };
-        self.live -= 1;
+        self.live.set(self.live.get() - 1);
+    }
+
+    /// Stop counting a live item as part of this pool without freeing
+    /// it. The caller now owns the item and must free it with the item
+    /// allocator (or `adopt` it back).
+    pub fn disown(&self, item: PagePoolItemPtr) {
+        let _ = item;
+        debug_assert!(self.free.len() < self.live.get());
+        self.live.set(self.live.get() - 1);
+    }
+
+    /// Count an item allocated from the item allocator, with this pool's
+    /// layout, as a live item of this pool again. Reserving its free-list
+    /// slot here keeps `destroy` infallible.
+    pub fn adopt(&mut self, item: PagePoolItemPtr) -> Result<(), AllocError> {
+        let _ = item;
+        self.reserve_free_slot()?;
+        self.live.set(self.live.get() + 1);
+        Ok(())
+    }
+
+    fn reserve_free_slot(&mut self) -> Result<(), AllocError> {
+        let need = self.live.get() + 1;
+        if self.free.capacity() < need {
+            self.free
+                .try_reserve(need - self.free.len())
+                .map_err(|_| AllocError::OutOfMemory)?;
+        }
+        Ok(())
     }
 
     fn alloc_item(&mut self) -> Result<PagePoolItemPtr, AllocError> {
         // SAFETY: nonzero size.
         let memory = unsafe { self.allocator.alloc(Self::layout()) };
         let ptr = NonNull::new(memory).ok_or(AllocError::OutOfMemory)?;
-        self.live += 1;
+        self.live.set(self.live.get() + 1);
         Ok(ptr)
     }
 }
@@ -750,7 +990,7 @@ impl PagePool {
 impl Drop for PagePool {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            debug_assert_eq!(self.live, self.free.len());
+            debug_assert_eq!(self.live.get(), self.free.len());
         }
         for item in self.free.drain(..) {
             // SAFETY: free items were allocated from `allocator` with layout().
@@ -858,6 +1098,24 @@ pub struct PageList {
     /// pair per page is a significant part of reflow cost. Always null
     /// outside of an in-progress reflow.
     pub recycle_node: Option<NodePtr>,
+
+    /// A page pruned by the scrollback limits, kept committed for the next
+    /// createPage instead of going back to the pool.
+    ///
+    /// Once scrollback is full, pruning retires one history page for
+    /// every page grow appends, but the two rarely happen on the same
+    /// row: the line limit usually prunes from grow's fast path and the
+    /// replacement page is only needed when the last page fills. Returning
+    /// the pruned buffer to the pool decommits it, and the next page then
+    /// faults every byte of the same buffer back in. Keeping one page
+    /// here turns that into a memset of resident memory.
+    ///
+    /// Only pool-owned resident pages are kept, and only one. The spare is
+    /// not in `page_size` and keeps its stale contents until createPage
+    /// zeroes it. It goes back to the pool (decommitted) on compress, and
+    /// is released on reset and deinit, so an idle PageList holds no extra
+    /// resident memory once its embedder compresses it.
+    pub spare_node: Option<NodePtr>,
 
     /// Limits for scrollback.
     pub limits: Limits,
@@ -1093,13 +1351,11 @@ fn init_one_page(
     // bytes; `node` is an uninitialized pool item.
     unsafe {
         let mem = PageMemory::from_raw_parts(buf.0.as_ptr(), buf.1);
-        node.as_ptr().write(Node {
-            prev: None,
-            next: None,
-            data: NodeData::Resident(Page::init_buf(OffsetBuf::init(mem), layout)),
+        node.as_ptr().write(Node::new(
+            NodeData::Resident(Page::init_buf(OffsetBuf::init(mem), layout)),
             serial,
-            owned: if pooled { Owned::Pool } else { Owned::Heap },
-        });
+            if pooled { Owned::Pool } else { Owned::Heap },
+        ));
     }
 
     Ok((node, buf.1))
@@ -1184,6 +1440,15 @@ fn release_pages(pool: &mut MemoryPool, list: List) {
         unsafe {
             let n = nd(node);
             it = n.next;
+            if let Some(shared) = n.shared {
+                SharedResident::release(shared);
+                pool.nodes.destroy(node);
+                continue;
+            }
+            if n.discard_unmapped().is_some() {
+                pool.nodes.destroy(node);
+                continue;
+            }
             let owned = n.owned;
             let page = *n.restore(RestoreMode::Discard);
             match owned {
@@ -1210,6 +1475,20 @@ fn release_pool_page(pool: &mut MemoryPool, page: &Page) {
     pool.pages.release(item);
 }
 
+/// How `release_spare` gives the spare back (Zig: its comptime mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpareRelease {
+    Decommit,
+    Free,
+}
+
+/// How `erase_page` releases the page (Zig: its comptime `release`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EraseRelease {
+    Destroy,
+    Retire,
+}
+
 /// Options for `clone` (Zig: `PageList.Clone`).
 #[derive(Debug)]
 pub struct Clone<'a> {
@@ -1217,6 +1496,12 @@ pub struct Clone<'a> {
     /// The x coordinate is ignored; the full row is always cloned.
     pub top: point::Point,
     pub bot: Option<point::Point>,
+
+    /// Clone copy-on-write: whole compressed pages share their encoding,
+    /// whole resident history pages share their memory until either side
+    /// writes, and the rest is copied at its used size. The clone has no
+    /// scrollback limits.
+    pub cow: bool,
 
     /// If this is non-null then cloning will attempt to remap the tracked
     /// pins into the new cloned area and will keep track of the old to
@@ -1743,13 +2028,11 @@ fn create_page_ext(
     // and an uninitialized node pool item.
     unsafe {
         let mem = PageMemory::from_raw_parts(buf.0.as_ptr(), buf.1);
-        page.as_ptr().write(Node {
-            prev: None,
-            next: None,
-            data: NodeData::Resident(Page::init_buf(OffsetBuf::init(mem), layout)),
-            serial: *serial,
-            owned: if pooled { Owned::Pool } else { Owned::Heap },
-        });
+        page.as_ptr().write(Node::new(
+            NodeData::Resident(Page::init_buf(OffsetBuf::init(mem), layout)),
+            *serial,
+            if pooled { Owned::Pool } else { Owned::Heap },
+        ));
         nd(page).page().size.rows = 0;
     }
     *serial += 1;
@@ -1995,9 +2278,57 @@ pub enum DecommitError {
 /// deliberately simulates successful decommit in test builds.
 static COMPRESS_PAGE_TW: tripwire::Module<CompressPageFailPoint, DecommitError> = tripwire::Module::new();
 
+/// Recommit a page trimmed by trimLastPage before writing past its size.
+#[inline]
+fn untrim(node: &mut Node) {
+    if !node.trimmed {
+        return;
+    }
+    node.trimmed = false;
+    let memory = node.page_assume_resident().memory;
+    // SAFETY: the node's own resident mapping.
+    terminal_mem::recommit(unsafe { memory.as_mut_slice() });
+}
+
+/// Whether every byte is zero. This ORs 32 bytes per step with no early
+/// exit, which the compiler vectorizes.
+fn is_zero(bytes: &[u8]) -> bool {
+    let mut acc = [0u8; 32];
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in &mut chunks {
+        for (a, b) in acc.iter_mut().zip(chunk) {
+            *a |= *b;
+        }
+    }
+    for &b in chunks.remainder() {
+        acc[0] |= b;
+    }
+    acc.iter().fold(0, |a, b| a | b) == 0
+}
+
 /// Destroy the memory of the given node and return it to the pool. The
 /// node is assumed to already be removed from any linked list.
-fn destroy_node_ext(pool: &mut MemoryPool, node: NodePtr, total_size: Option<&mut usize>) {
+fn destroy_node_ext(pool: &mut MemoryPool, node: NodePtr, mut total_size: Option<&mut usize>) {
+    // SAFETY: the node is live until destroyed.
+    unsafe {
+        let n = nd(node);
+        if let Some(shared) = n.shared {
+            if let Some(v) = total_size {
+                *v -= shared.as_ref().memory.len();
+            }
+            SharedResident::release(shared);
+            pool.nodes.destroy(node);
+            return;
+        }
+        if let Some(raw_len) = n.discard_unmapped() {
+            if let Some(v) = total_size.as_deref_mut() {
+                *v -= raw_len;
+            }
+            pool.nodes.destroy(node);
+            return;
+        }
+    }
+
     // SAFETY: the node is live until destroyed at the end.
     let (owned, page) = unsafe {
         let n = nd(node);
@@ -2137,6 +2468,7 @@ impl PageList {
             page_size,
             page_compression: IncrementalCompressionState::default(),
             recycle_node: None,
+            spare_node: None,
             limits,
             total_rows: rows as usize,
             tracked_pins,
@@ -2300,6 +2632,23 @@ impl PageList {
         Ok(())
     }
 
+    /// Give the spare node (see spare_node) back to the pools. Decommit mode
+    /// returns its buffer to the page pool zeroed and decommitted, like
+    /// destroyNode. Free mode is for teardown walks and releases the buffer
+    /// straight to the page allocator without zeroing it, like releasePages.
+    fn release_spare(&mut self, mode: SpareRelease) {
+        let Some(node) = self.spare_node.take() else { return };
+        match mode {
+            SpareRelease::Decommit => destroy_node_ext(&mut self.pool, node, None),
+            SpareRelease::Free => {
+                // SAFETY: the spare is a live, detached, pool-owned resident node.
+                let page = unsafe { *nd(node).page_assume_resident() };
+                release_pool_page(&mut self.pool, &page);
+                self.pool.nodes.destroy(node);
+            }
+        }
+    }
+
     /// Reset the PageList back to an empty state. This is similar to
     /// deinit and reinit but it importantly preserves the pointer
     /// stability of tracked pins (they're moved to the top-left since
@@ -2329,6 +2678,7 @@ impl PageList {
         // Before resetting our pools we need to release our pages: heap-owned
         // pages go back to the page allocator and pool-owned pages back to
         // the page pool.
+        self.release_spare(SpareRelease::Free);
         release_pages(&mut self.pool, self.pages);
 
         // Reset our pools to free as much memory as possible while retaining
@@ -2393,7 +2743,9 @@ impl PageList {
         let mut it = self.page_iterator(Direction::RightDown, opts.top, opts.bot);
 
         // First, count our pages so our preheat is exactly what we need.
-        let page_count: usize = {
+        let page_count: usize = if opts.cow {
+            0
+        } else {
             let mut it_copy = it;
             let mut count: usize = 0;
             while it_copy.next().is_some() {
@@ -2430,7 +2782,12 @@ impl PageList {
             page_size: 0,
             page_compression: IncrementalCompressionState::default(),
             recycle_node: None,
-            limits: self.limits,
+            spare_node: None,
+            limits: if opts.cow {
+                Limits::init(self.cols, self.rows)
+            } else {
+                self.limits
+            },
             cols: self.cols,
             rows: self.rows,
             total_rows: 0,
@@ -2445,30 +2802,101 @@ impl PageList {
         // SAFETY: source chunks are live nodes of `self`; destination nodes
         // are live nodes of `result`.
         unsafe {
+            let active_offset = self.total_rows - self.rows as usize;
             while let Some(chunk) = it.next() {
-                // Clone the page. We have to use createPageExt here because
-                // we don't know if the source page has a standard size.
-                let node = create_page_ext(
-                    &mut result.pool,
-                    CreatePage::cap(nd(chunk.node).capacity()),
-                    &mut result.page_serial,
-                    Some(&mut result.page_size),
-                )?;
+                let source = nd(chunk.node);
+                let whole_page = chunk.start == 0 && chunk.end == source.rows();
+                let history_page = result.total_rows + source.rows() as usize <= active_offset;
+                let node = if opts.cow && whole_page && source.is_compressed() {
+                    // Compressed history shares (or copies) its encoding and
+                    // maps raw memory only when first read.
+                    let NodeData::Compressed(compressed) = &source.data else { unreachable!() };
+                    let node = result.pool.nodes.create().map_err(pool_err)?;
+                    let data = match compressed.clone_for(alloc, result.pool.pages.allocator) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            result.pool.nodes.destroy(node);
+                            return Err(e.into());
+                        }
+                    };
+                    node.as_ptr()
+                        .write(Node::new(NodeData::Compressed(data), result.page_serial, Owned::Heap));
+                    result.page_serial += 1;
+                    result.page_size += nd(node).raw_len();
+                    result.pages.append(node);
+                    node
+                } else if opts.cow && whole_page && history_page {
+                    // Resident history shares its memory copy-on-write.
+                    let backing = match source.shared {
+                        Some(b) => b,
+                        None => {
+                            let NodeData::Resident(page) = &mut source.data else { unreachable!() };
+                            let memory = match source.owned {
+                                Owned::Pool => PageMemory::from_raw_parts(page.memory.ptr(), std_size()),
+                                Owned::Heap => page.memory,
+                            };
+                            let backing = alloc.create(SharedResident {
+                                references: AtomicUsize::new(1),
+                                memory,
+                                alloc,
+                                page_alloc: self.pool.pages.allocator,
+                            })?;
+                            if source.owned == Owned::Pool {
+                                // The item now belongs to the shared backing,
+                                // so the source accounts it as heap memory
+                                // of the same length until it can go back.
+                                self.pool.pages.disown(NonNull::new_unchecked(memory.ptr()));
+                                source.owned = Owned::Heap;
+                                source.pool_backing = true;
+                                page.memory = memory;
+                            }
+                            source.shared = Some(backing);
+                            backing
+                        }
+                    };
+                    let node = result.pool.nodes.create().map_err(pool_err)?;
+                    backing.as_ref().references.fetch_add(1, Ordering::Relaxed);
+                    let NodeData::Resident(page) = &source.data else { unreachable!() };
+                    let mut shared = Node::new(NodeData::Resident(*page), result.page_serial, Owned::Heap);
+                    shared.shared = Some(backing);
+                    node.as_ptr().write(shared);
+                    result.page_serial += 1;
+                    result.page_size += backing.as_ref().memory.len();
+                    result.pages.append(node);
+                    node
+                } else {
+                    // Clone the page. We have to use createPageExt here because
+                    // we don't know if the source page has a standard size. A
+                    // copy-on-write clone copies only the used rows.
+                    let mut cap = source.capacity();
+                    if opts.cow {
+                        cap.rows = chunk.end - chunk.start;
+                        cap.cols = source.cols();
+                    }
+                    let node = create_page_ext(
+                        &mut result.pool,
+                        CreatePage {
+                            cap,
+                            exact_size: opts.cow,
+                        },
+                        &mut result.page_serial,
+                        Some(&mut result.page_size),
+                    )?;
 
-                // Add the page to the list immediately so that the errdefer
-                // above releases it if cloning fails.
-                result.pages.append(node);
+                    // Add the page to the list immediately so that the errdefer
+                    // above releases it if cloning fails.
+                    result.pages.append(node);
 
-                let dst_page: *mut Page = nd(node).page();
-                let src_page: *mut Page = nd(chunk.node).page();
-                assert!(nd(node).capacity().rows >= chunk.end - chunk.start);
-                (*dst_page).size.rows = chunk.end - chunk.start;
-                (*dst_page).size.cols = nd(chunk.node).cols();
-                let r = (*dst_page).clone_from(src_page, chunk.start as usize, chunk.end as usize);
-                (*dst_page).assert_integrity();
-                r.map_err(CloneError::CloneFrom)?;
-
-                (*dst_page).dirty = (*src_page).dirty;
+                    let dst_page: *mut Page = nd(node).page();
+                    let src_page: *mut Page = nd(chunk.node).page();
+                    (*dst_page).size.rows = chunk.end - chunk.start;
+                    (*dst_page).size.cols = nd(chunk.node).cols();
+                    (*dst_page)
+                        .clone_from(src_page, chunk.start as usize, chunk.end as usize)
+                        .map_err(CloneError::CloneFrom)?;
+                    (*dst_page).dirty = (*src_page).dirty;
+                    node
+                };
 
                 result.total_rows += nd(node).rows() as usize;
 
@@ -2713,7 +3141,7 @@ impl PageList {
             let mut row_it = p.row_iterator(Direction::LeftUp, active_pin);
             while let Some(next) = row_it.next() {
                 // SAFETY: valid pin from the iterator.
-                let row = unsafe { &*next.row_and_cell().row };
+                let row = unsafe { &*next.row_and_cell_read().row };
                 if row.wrap_continuation() {
                     wrapped += 1;
                 }
@@ -2750,18 +3178,18 @@ impl PageList {
         // Create the first node that contains our reflow.
         // SAFETY: the first node is live.
         let first_rewritten_node = unsafe {
-            let page = nd(self.pages.first.unwrap()).page();
-            let cap = match page.capacity.adjust(pagepkg::Adjustment { cols: Some(cols) }) {
+            let first = nd(self.pages.first.unwrap());
+            let cap = match first.capacity().adjust(pagepkg::Adjustment { cols: Some(cols) }) {
                 Ok(c) => c,
                 Err(_) => {
                     // We verify all maxed out page layouts work.
-                    let mut cap = page.capacity;
+                    let mut cap = first.capacity();
                     cap.cols = cols;
 
                     // We're growing columns so we can only get less rows so use
                     // the lesser of our capacity and size so we minimize wasted
                     // rows.
-                    cap.rows = page.size.rows.min(cap.rows);
+                    cap.rows = first.rows().min(cap.rows);
                     cap
                 }
             };
@@ -2902,7 +3330,7 @@ impl PageList {
                     let mut row_it = tracked.row_iterator(Direction::LeftUp, active_pin);
                     while let Some(next) = row_it.next() {
                         // SAFETY: valid pin from the iterator.
-                        let row = unsafe { &*next.row_and_cell().row };
+                        let row = unsafe { &*next.row_and_cell_read().row };
                         if row.wrap_continuation() {
                             wrapped += 1;
                         }
@@ -3218,6 +3646,8 @@ impl PageList {
                     if (*prev_page).size.rows >= (*prev_page).capacity.rows {
                         break 'prev;
                     }
+                    untrim(nd(prev_node));
+                    let prev_page: *mut Page = nd(prev_node).page();
 
                     // We can copy as much as we can to fill the capacity or our
                     // current page size.
@@ -3446,7 +3876,7 @@ impl PageList {
 
                 page.size.rows -= 1;
                 if page.size.rows == 0 {
-                    self.erase_page(row_pin.node);
+                    self.erase_page(row_pin.node, EraseRelease::Destroy);
                 } else {
                     page.assert_integrity();
                 }
@@ -4234,7 +4664,10 @@ impl PageList {
                 // because the page memory was never used (pool buffers are
                 // zeroed) or because whatever retired the row reset it (see
                 // Page.resetRow).
-                let page = nd(last).page();
+                let n = nd(last);
+                n.page();
+                untrim(n);
+                let page = n.page_assume_resident();
                 page.size.rows += 1;
                 page.assert_integrity();
 
@@ -4328,6 +4761,7 @@ impl PageList {
 
                     // Reset our memory
                     let buf = nd(first).restore(RestoreMode::Discard).memory;
+                    untrim(nd(first));
                     core::ptr::write_bytes(buf.ptr(), 0, buf.len());
                     assert!(buf.len() <= std_size());
 
@@ -4588,55 +5022,83 @@ impl PageList {
         // see recycle_node), reuse it directly rather than going through
         // the memory pool.
         if let Some(node) = self.recycle_node {
-            'recycle: {
-                // SAFETY: the recycle node is live (removed from the list).
-                unsafe {
-                    // Only a standard pool-owned resident node can be rebuilt
-                    // in place for a standard-size layout.
-                    if opts.exact_size {
-                        break 'recycle;
-                    }
-                    if nd(node).owned != Owned::Pool {
-                        break 'recycle;
-                    }
-                    if nd(node).storage() != Storage::Resident {
-                        break 'recycle;
-                    }
-                    let layout = Page::layout(opts.cap);
-                    if layout.total_size > std_size() {
-                        break 'recycle;
-                    }
+            if self.rebuild_node(node, opts) {
+                // Accounting: a pool-owned node always accounts for a full
+                // pool item in page_size, so destroying the node and
+                // creating a new pooled one is a net zero.
+                self.recycle_node = None;
+                return Ok(node);
+            }
+        }
 
-                    self.recycle_node = None;
-
-                    // The pool guarantees that buffers it hands out are zeroed.
-                    // A pool-owned page dirties only its Page.memory prefix of
-                    // the underlying standard-size item, so zeroing that prefix
-                    // re-establishes the guarantee (this mirrors destroyNodeExt,
-                    // minus the decommit).
-                    let page = *nd(node).page_assume_resident();
-                    let item = PageMemory::from_raw_parts(page.memory.ptr(), std_size());
-                    core::ptr::write_bytes(page.memory.ptr(), 0, page.memory.len());
-
-                    // Accounting: a pool-owned node always accounts for a full
-                    // pool item in page_size, so destroying the node and
-                    // creating a new pooled one is a net zero.
-
-                    node.as_ptr().write(Node {
-                        prev: None,
-                        next: None,
-                        data: NodeData::Resident(Page::init_buf(OffsetBuf::init(item), layout)),
-                        serial: self.page_serial,
-                        owned: Owned::Pool,
-                    });
-                    nd(node).page().size.rows = 0;
-                    self.page_serial += 1;
-                    return Ok(node);
-                }
+        // Otherwise prefer the retired spare (see spare_node) over a pool
+        // buffer, which would have to be faulted back in. The spare left
+        // page_size when it was retired, so it counts again once reused.
+        if let Some(node) = self.spare_node {
+            if self.rebuild_node(node, opts) {
+                self.spare_node = None;
+                self.page_size += PagePool::item_size();
+                return Ok(node);
             }
         }
 
         create_page_ext(&mut self.pool, opts, &mut self.page_serial, Some(&mut self.page_size))
+    }
+
+    /// Rebuild a detached node in place as a new empty page for `opts`,
+    /// as if createPageExt had taken its buffer from the pool. This returns
+    /// false and leaves the node untouched if it cannot hold the layout.
+    fn rebuild_node(&mut self, node: NodePtr, opts: CreatePage) -> bool {
+        // SAFETY: the node is live and detached from the list.
+        unsafe {
+            let n = nd(node);
+
+            // Only a standard pool-owned resident node can be rebuilt
+            // in place for a standard-size layout.
+            if opts.exact_size {
+                return false;
+            }
+            if n.owned != Owned::Pool {
+                return false;
+            }
+            if n.storage() != Storage::Resident {
+                return false;
+            }
+            let layout = Page::layout(opts.cap);
+            if layout.total_size > std_size() {
+                return false;
+            }
+
+            // The pool guarantees that buffers it hands out are zeroed.
+            // A pool-owned page dirties only its Page.memory prefix of
+            // the underlying standard-size item, so zeroing that prefix
+            // re-establishes the guarantee (this mirrors destroyNodeExt,
+            // minus the decommit).
+            //
+            // The metadata block after the cells (styles, graphemes, strings,
+            // hyperlinks) is often never written, and then it may never have
+            // been faulted in either, so it is only cleared when something is
+            // there: zeroing it anyway would make it resident for nothing.
+            untrim(n);
+            let page = *n.page_assume_resident();
+            let item = PageMemory::from_raw_parts(page.memory.ptr(), std_size());
+            let old = Page::layout(page.capacity);
+            let memory = page.memory.as_mut_slice();
+            memory[..old.styles_start].fill(0);
+            let meta = &mut memory[old.styles_start..];
+            if !is_zero(meta) {
+                meta.fill(0);
+            }
+
+            node.as_ptr().write(Node::new(
+                NodeData::Resident(Page::init_buf(OffsetBuf::init(item), layout)),
+                self.page_serial,
+                Owned::Pool,
+            ));
+            nd(node).page().size.rows = 0;
+            self.page_serial += 1;
+            true
+        }
     }
 
     /// Compress eligible nodes, saving a significant amount of memory.
@@ -4660,7 +5122,13 @@ impl PageList {
     /// compression state. On supported targets, full compression returns
     /// `complete`, indicating that it has no continuation to schedule rather than
     /// that every page was compressed.
+    ///
+    /// Every mode first returns the spare page (see spare_node) to the pool
+    /// and decommits the unused rows of the last page (see trimLastPage), since
+    /// a caller compressing is done writing for now.
     pub fn compress(&mut self, mode: CompressMode) -> IncrementalCompressionResult {
+        self.release_spare(SpareRelease::Decommit);
+        self.trim_last_page();
         match mode {
             CompressMode::Incremental => self.compress_incremental(),
             CompressMode::Drain => loop {
@@ -4898,6 +5366,91 @@ impl PageList {
     /// updates `page_size` (byte accounting), not row accounting.
     fn destroy_node(&mut self, node: NodePtr) {
         destroy_node_ext(&mut self.pool, node, Some(&mut self.page_size));
+    }
+
+    /// Decommit the cells behind the last page's unused rows.
+    ///
+    /// Rows past a page's size are zero by contract (see grow), so readers see
+    /// no difference. A page rebuilt from the spare has all of them resident
+    /// after its memset, where a fresh pool page only faults in the rows it
+    /// uses, so an idle list gives them back here. The node is marked so the
+    /// next write past its size recommits them first.
+    fn trim_last_page(&mut self) {
+        let node = self.pages.last.unwrap();
+        // SAFETY: the last node is live.
+        let n = unsafe { nd(node) };
+        if n.trimmed {
+            return;
+        }
+        let Some(page) = n.page_if_resident() else { return };
+        let cap = page.capacity;
+        if page.size.rows >= cap.rows {
+            return;
+        }
+
+        let layout = Page::layout(cap);
+        let base = page.memory.ptr() as usize;
+        let row_bytes = cap.cols as usize * core::mem::size_of::<pagepkg::Cell>();
+        let mut unused = base + layout.cells_start;
+        // eraseRows can move row headers without moving their cell blocks.
+        // SAFETY: the first `size.rows` row headers are within the page.
+        let rows = unsafe { core::slice::from_raw_parts(page.rows.ptr(page.memory), page.size.rows as usize) };
+        for row in rows {
+            unused = unused.max(base + row.cells().offset as usize + row_bytes);
+        }
+        let start = unused.next_multiple_of(PAGE_SIZE_MIN);
+        let end = (base + layout.cells_start + layout.cells_size) / PAGE_SIZE_MIN * PAGE_SIZE_MIN;
+        if end <= start {
+            return;
+        }
+
+        // SAFETY: [start, end) is a whole number of pages inside the cell
+        // block of this resident page, behind rows no live row references.
+        let range = unsafe { core::slice::from_raw_parts_mut(start as *mut u8, end - start) };
+        terminal_mem::decommit(DecommitMode::Zero, range, 0);
+        n.trimmed = true;
+    }
+
+    /// Destroy a node like destroyNode, but keep it committed as the spare
+    /// (see spare_node) when the slot is free and createPage could rebuild
+    /// it. A compressed node is destroyed: its memory is already decommitted,
+    /// so keeping it would save nothing.
+    fn retire_node(&mut self, node: NodePtr) {
+        // SAFETY: the node is live and removed from the list.
+        let n = unsafe { nd(node) };
+        if self.spare_node.is_none() && n.pool_backing && n.storage() == Storage::Resident {
+            if let Some(shared) = n.shared {
+                // SAFETY: this node holds a reference.
+                let backing = unsafe { shared.as_ref() };
+                if backing.references.load(Ordering::Acquire) != 1 {
+                    self.destroy_node(node);
+                    return;
+                }
+                n.shared = None;
+                let alloc = backing.alloc;
+                // SAFETY: the last reference; the memory stays with the node.
+                unsafe { alloc.destroy(shared) };
+            }
+            let NodeData::Resident(page) = &n.data else { unreachable!() };
+            // SAFETY: pool-backed memory is a whole item from the pool allocator.
+            let item = unsafe { NonNull::new_unchecked(page.memory.ptr()) };
+            if self.pool.pages.adopt(item).is_err() {
+                panic!("terminal page pool transfer failed");
+            }
+            n.pool_backing = false;
+            n.owned = Owned::Pool;
+        }
+        if self.spare_node.is_some() || n.owned != Owned::Pool || n.storage() != Storage::Resident || n.shared.is_some()
+        {
+            self.destroy_node(node);
+            return;
+        }
+
+        // Mirror destroyNode's accounting: the spare is not a list page.
+        self.page_size -= PagePool::item_size();
+        n.prev = None;
+        n.next = None;
+        self.spare_node = Some(node);
     }
 
     /// Clone the given source row into the row at `dst_y` of the given
@@ -5335,7 +5888,10 @@ impl PageList {
                     if nd(chunk.node).next.is_none() && nd(chunk.node).prev.is_none() {
                         // Reinitializing the sole page invalidates every coordinate in it.
                         self.invalidate_node_layout(chunk.node);
-                        let page = nd(chunk.node).page();
+                        let n = nd(chunk.node);
+                        n.page();
+                        untrim(n);
+                        let page = n.page_assume_resident();
                         erased += page.size.rows as usize;
                         page.reinit();
                         page.size.rows = 0;
@@ -5351,7 +5907,7 @@ impl PageList {
                             }
                         }
                     }
-                    self.erase_page(chunk.node);
+                    self.erase_page(chunk.node, EraseRelease::Destroy);
                     continue;
                 }
 
@@ -5436,12 +5992,13 @@ impl PageList {
     /// Erase a single page, freeing all its resources. The page must be
     /// at the front or back of the linked list (not the middle) and must
     /// NOT be the final page in the entire list (i.e. must not make the
-    /// list empty).
+    /// list empty). Retire mode may keep the page committed as the spare
+    /// (see spare_node) for the next page this list creates.
     ///
     /// IMPORTANT: This function does NOT update `total_rows`. The caller is
     /// responsible for accounting for the removed rows before or after calling
     /// this function.
-    fn erase_page(&mut self, node: NodePtr) {
+    fn erase_page(&mut self, node: NodePtr, release: EraseRelease) {
         // SAFETY: caller passes a live node; tracked pins are live.
         unsafe {
             let n = nd(node);
@@ -5471,7 +6028,10 @@ impl PageList {
             // Remove the page from the linked list
             self.pages.remove(node);
         }
-        self.destroy_node(node);
+        match release {
+            EraseRelease::Destroy => self.destroy_node(node),
+            EraseRelease::Retire => self.retire_node(node),
+        }
     }
 
     /// Returns the pin for the given point. The pin is NOT tracked so it
@@ -6293,6 +6853,14 @@ impl PageList {
 
     /// Return a metadata-only snapshot of page backing storage.
     ///
+    /// The raw byte counts describe logical page backing sizes. They exclude
+    /// nodes, allocator metadata, unused preheated pool items, the spare page
+    /// (see spare_node), and the small representation values stored in each
+    /// node. Live compressed pages retain raw mappings as virtual address space.
+    /// Their bytes count as decommitted after strict reclamation succeeds.
+    /// Immutable compressed clones count their saved raw length as unmapped
+    /// until first access allocates a private range.
+    ///
     /// This never restores compressed pages. It is intended for diagnostics and
     /// other infrequent reporting because it traverses the complete page list.
     pub fn memory_stats(&self) -> MemoryStats {
@@ -6301,7 +6869,7 @@ impl PageList {
         while let Some(node) = current {
             // SAFETY: live list node.
             let n = unsafe { nd(node) };
-            let raw_len = n.metadata().memory.len();
+            let raw_len = n.raw_len();
             let backing_len = match n.owned {
                 Owned::Pool => PagePool::item_size(),
                 Owned::Heap => raw_len,
@@ -6313,12 +6881,18 @@ impl PageList {
                 NodeData::Resident(_) => {
                     result.resident_pages += 1;
                     result.resident_raw_bytes += raw_len;
+                    result.reserved_backing_bytes += backing_len;
                     result.resident_backing_bytes += backing_len;
                 }
 
                 NodeData::Compressed(compressed) => {
                     result.compressed_pages += 1;
-                    result.decommitted_raw_bytes += raw_len;
+                    if compressed.page.memory.len() == 0 {
+                        result.unmapped_raw_bytes += raw_len;
+                    } else {
+                        result.decommitted_raw_bytes += raw_len;
+                        result.reserved_backing_bytes += backing_len;
+                    }
                     // Strict reclamation covers only Page.memory. A standard pool
                     // item can have an unused tail which remains resident.
                     result.resident_backing_bytes += backing_len - raw_len;
@@ -6340,10 +6914,13 @@ impl PageList {
     /// every write.
     pub fn memory_usage(&self) -> MemoryUsage {
         let stats = self.memory_stats();
+        // The spare (see spare_node) is a committed pool item that is neither a
+        // list page nor a free pool item, so neither figure above includes it.
+        let spare: usize = if self.spare_node.is_some() { PagePool::item_size() } else { 0 };
         MemoryUsage {
             pages: stats.resident_pages + stats.compressed_pages,
-            virtual_bytes: self.page_size + self.pool.pages.free_count() * PagePool::item_size(),
-            resident_bytes: stats.estimated_resident_bytes(),
+            virtual_bytes: self.page_size + self.pool.pages.free_count() * PagePool::item_size() + spare,
+            resident_bytes: stats.estimated_resident_bytes() + spare,
             compressed_pages: stats.compressed_pages,
             compressed_bytes: stats.encoded_bytes,
         }
@@ -6404,6 +6981,7 @@ impl Drop for PageList {
         }
 
         // Release every page and node back to the pools, then free the pools.
+        self.release_spare(SpareRelease::Free);
         release_pages(&mut self.pool, self.pages);
         self.pages = List::new();
     }
@@ -6545,8 +7123,8 @@ impl ReflowCursor {
         // SAFETY: the source row is a valid pin into a live source node; the
         // destination pointers are into live destination nodes.
         unsafe {
-            let src_page: *mut Page = nd(row.node).page();
-            let src_row: *mut Row = row.row_and_cell().row;
+            let src_page: *const Page = nd(row.node).page_read();
+            let src_row: *const Row = row.row_and_cell_read().row;
             let src_y = row.y;
             let cells: &[pagepkg::Cell] = core::slice::from_raw_parts(
                 (*src_row).cells().ptr((*src_page).memory),
@@ -8165,10 +8743,10 @@ pub struct MemoryStats {
     /// Pages whose raw backing mappings are resident.
     pub resident_pages: usize,
 
-    /// Pages represented by encoded storage and a decommitted raw mapping.
+    /// Pages represented by encoded storage, with optional raw mappings.
     pub compressed_pages: usize,
 
-    /// Logical bytes in every raw page mapping.
+    /// Logical raw bytes across resident and compressed pages.
     pub raw_bytes: usize,
 
     /// Raw mapping bytes which remain resident.
@@ -8176,6 +8754,12 @@ pub struct MemoryStats {
 
     /// Raw mapping bytes discarded for compressed pages.
     pub decommitted_raw_bytes: usize,
+
+    /// Raw bytes of compressed clones that have no mapping yet.
+    pub unmapped_raw_bytes: usize,
+
+    /// Backing bytes of every raw mapping that exists, resident or not.
+    pub reserved_backing_bytes: usize,
 
     /// Raw allocation bytes which remain physically resident.
     ///
@@ -8196,7 +8780,7 @@ impl MemoryStats {
 
     /// Estimate physical bytes avoided by compressed page backing storage.
     pub fn estimated_savings(self) -> usize {
-        self.decommitted_raw_bytes.saturating_sub(self.encoded_bytes)
+        (self.decommitted_raw_bytes + self.unmapped_raw_bytes).saturating_sub(self.encoded_bytes)
     }
 }
 
@@ -8208,15 +8792,17 @@ pub struct MemoryUsage {
 
     /// Bytes of address space reserved for page memory. This counts every
     /// page in the list at its full allocated size, whether it is resident
-    /// or compressed, plus the unused items held by the page pool. Unused
-    /// pool items have had their physical memory released, so they add to
-    /// this figure but never to `resident_bytes`.
+    /// or compressed, plus the unused items held by the page pool and the
+    /// spare page (see `spare_node`). Unused pool items have had their
+    /// physical memory released, so they add to this figure but never to
+    /// `resident_bytes`.
     pub virtual_bytes: usize,
 
     /// Bytes of physical memory used by pages. A resident page counts its
     /// full allocated size. A compressed page counts its encoded data plus
     /// any unused tail of its pool item, which compression doesn't release.
-    /// This is the same as `MemoryStats.estimatedResidentBytes`.
+    /// This is `MemoryStats.estimatedResidentBytes` plus the spare page,
+    /// which stays committed.
     pub resident_bytes: usize,
 
     /// Number of pages stored compressed.
@@ -8360,8 +8946,10 @@ impl Limits {
 
             // erasePage updates the list, pin targets, and byte accounting.
             // Row accounting belongs to the caller because erasePage is also used
-            // by paths that already adjusted total_rows.
-            pagelist.erase_page(first);
+            // by paths that already adjusted total_rows. The pruned page is
+            // retired rather than destroyed: history is full, so grow will want
+            // a new page soon (see spare_node).
+            pagelist.erase_page(first, EraseRelease::Retire);
             pagelist.total_rows -= first_rows;
             removed += first_rows;
         }
@@ -8483,6 +9071,18 @@ impl Pin {
     #[inline]
     pub unsafe fn node_mut<'a>(&self) -> &'a mut Node {
         unsafe { nd(self.node) }
+    }
+
+    /// Row and cell for reading only. Unlike `row_and_cell` this keeps
+    /// copy-on-write memory shared (a compressed page is still restored).
+    #[inline]
+    pub fn row_and_cell_read(&self) -> RowAndCellRead {
+        // SAFETY: valid pin (type contract).
+        let rac = unsafe { nd(self.node).page_read().get_row_and_cell(self.x as usize, self.y as usize) };
+        RowAndCellRead {
+            row: rac.row,
+            cell: rac.cell,
+        }
     }
 
     #[inline]
@@ -9126,6 +9726,7 @@ impl Builder {
             page_size: self.page_size,
             page_compression: IncrementalCompressionState::default(),
             recycle_node: None,
+            spare_node: None,
             limits,
             total_rows,
             tracked_pins,
@@ -9227,20 +9828,38 @@ pub(crate) mod testing {
         pub fail_index: AtomicUsize,
         pub alloc_index: AtomicUsize,
         pub allocations: AtomicUsize,
+        pub allocated_bytes: AtomicUsize,
         pub deallocations: AtomicUsize,
         pub has_induced_failure: AtomicBool,
+
+        /// The allocator that serves successful allocations and every free.
+        /// Zig's testing allocators share one backing; here page memory
+        /// must go back to the OS page allocator it came from.
+        backend: &'static (dyn GlobalAlloc + Sync),
     }
 
     impl FailingAllocator {
         /// Create a leaked (static) failing allocator.
         pub fn leak(fail_index: usize) -> &'static FailingAllocator {
+            Self::leak_over(fail_index, &System)
+        }
+
+        /// A leaked failing allocator over `backend`, for allocators that
+        /// stand in for a page allocator (use [`OS_PAGE_ALLOCATOR`]).
+        pub fn leak_over(fail_index: usize, backend: &'static (dyn GlobalAlloc + Sync)) -> &'static FailingAllocator {
             Box::leak(Box::new(FailingAllocator {
                 fail_index: AtomicUsize::new(fail_index),
                 alloc_index: AtomicUsize::new(0),
                 allocations: AtomicUsize::new(0),
+                allocated_bytes: AtomicUsize::new(0),
                 deallocations: AtomicUsize::new(0),
                 has_induced_failure: AtomicBool::new(false),
+                backend,
             }))
+        }
+
+        pub fn allocated_bytes(&self) -> usize {
+            self.allocated_bytes.load(Ordering::Relaxed)
         }
 
         pub fn allocator(&'static self) -> Allocator {
@@ -9277,12 +9896,13 @@ pub(crate) mod testing {
                 return core::ptr::null_mut();
             }
             self.allocations.fetch_add(1, Ordering::Relaxed);
-            unsafe { System.alloc(layout) }
+            self.allocated_bytes.fetch_add(layout.size(), Ordering::Relaxed);
+            unsafe { self.backend.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: AllocLayout) {
             self.deallocations.fetch_add(1, Ordering::Relaxed);
-            unsafe { System.dealloc(ptr, layout) }
+            unsafe { self.backend.dealloc(ptr, layout) }
         }
     }
 
@@ -9482,6 +10102,7 @@ mod tests {
             top,
             bot,
             tracked_pins: None,
+            cow: false,
         }
     }
 
@@ -9595,13 +10216,7 @@ mod tests {
         let mut data = page.0;
         data.size = pagepkg::Size { cols: 1, rows };
         let mut nodes: Vec<Node> = (0..count)
-            .map(|i| Node {
-                prev: None,
-                next: None,
-                data: NodeData::Resident(data),
-                serial: i as u64,
-                owned: Owned::Heap,
-            })
+            .map(|i| Node::new(NodeData::Resident(data), i as u64, Owned::Heap))
             .collect();
         let base = nodes.as_mut_ptr();
         for i in 0..count {
@@ -10149,6 +10764,17 @@ mod tests {
     }
 
     #[test]
+    fn page_list_initializes_only_its_used_pool_page_and_grows_on_demand() {
+        let mut s = init(80, 24);
+        assert_eq!(1, s.pool.pages.live());
+        assert_eq!(0, s.pool.pages.free_count());
+        s.grow_cold_pages_for_test(4);
+        assert_eq!(5, s.pool.pages.live());
+        assert_eq!(0, s.pool.pages.free_count());
+        s.assert_integrity();
+    }
+
+    #[test]
     fn page_list_owns_incremental_compression_state() {
         let mut s = init(80, 24);
 
@@ -10682,17 +11308,21 @@ mod tests {
         s.grow_cold_pages_for_test(2);
         let before = s.memory_usage();
         assert_eq!(s.total_pages(), before.pages);
+        let spare: usize = if s.spare_node.is_some() { PagePool::item_size() } else { 0 };
         assert_eq!(
-            s.page_size + s.pool.pages.free_count() * PagePool::item_size(),
+            s.page_size + s.pool.pages.free_count() * PagePool::item_size() + spare,
             before.virtual_bytes
         );
         assert!(before.resident_bytes <= before.virtual_bytes);
 
-        // Compression changes residency but not address space.
+        // Compression changes residency, and address space only for its
+        // scratch: it borrows a free pool item, and with one preheated item
+        // there is none, so the pool allocates one that stays in the pool.
+        let scratch: usize = if s.pool.pages.free_count() == 0 { PagePool::item_size() } else { 0 };
         let _ = s.compress(CompressMode::Full);
         let compressed = s.memory_usage();
         assert_eq!(before.pages, compressed.pages);
-        assert_eq!(before.virtual_bytes, compressed.virtual_bytes);
+        assert_eq!(before.virtual_bytes + scratch, compressed.virtual_bytes);
         assert!(compressed.resident_bytes < before.resident_bytes);
         assert_eq!(2, compressed.compressed_pages);
         assert!(compressed.compressed_bytes > 0);
@@ -10706,14 +11336,14 @@ mod tests {
         let restored = s.memory_usage();
         assert_eq!(1, restored.compressed_pages);
         assert!(restored.resident_bytes > compressed.resident_bytes);
-        assert_eq!(before.virtual_bytes, restored.virtual_bytes);
+        assert_eq!(compressed.virtual_bytes, restored.virtual_bytes);
 
         // Destroyed pages go back to the pool: the address space is kept but
         // the memory is no longer resident.
         s.erase_rows(pt_history(0, 0), None);
         let erased = s.memory_usage();
         assert!(erased.pages < restored.pages);
-        assert_eq!(before.virtual_bytes, erased.virtual_bytes);
+        assert_eq!(compressed.virtual_bytes, erased.virtual_bytes);
         assert!(erased.resident_bytes < restored.resident_bytes);
     }
 
@@ -12545,6 +13175,415 @@ mod tests {
             cloned.total_rows - cloned.rows as usize <= cloned.limits.max(LimitKey::Lines)
                 || cloned.pages.first.unwrap() == cloned.get_top_left(Tag::Active).node
         );
+    }
+
+    #[test]
+    fn page_list_max_lines_reuses_the_retired_page_without_the_pool() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        // A limit that is not page aligned prunes from grow's fast path, well
+        // before the last page fills and grow needs a new one.
+        let mut s = init_opts(Options {
+            cols,
+            rows: 24,
+            max_lines: Some(2 * page_rows + page_rows / 2),
+            ..Default::default()
+        });
+
+        while s.total_rows - (s.rows as usize) < s.limits.max(LimitKey::Lines) {
+            s.grow().unwrap();
+        }
+        assert!(s.spare_node.is_none());
+        let pool_live = s.pool.pages.live();
+        let pool_free = s.pool.pages.free_count();
+
+        // One more row prunes the complete first page. It is kept as the
+        // spare instead of going back to the pool, and leaves page_size.
+        let first_node = first(&s);
+        assert!(s.grow().unwrap().is_none());
+        assert_eq!(Some(first_node), s.spare_node);
+        assert!(first(&s) != first_node);
+        assert_eq!(pool_free, s.pool.pages.free_count());
+        assert_eq!(s.total_pages() * PagePool::item_size(), s.page_size);
+
+        // The next page grow needs is the spare, rebuilt as an empty page.
+        let mut reused: Option<NodePtr> = None;
+        while reused.is_none() {
+            reused = s.grow().unwrap();
+        }
+        assert_eq!(first_node, reused.unwrap());
+        assert_eq!(first_node, last(&s));
+        assert!(s.spare_node.is_none());
+        assert_eq!(1, n(first_node).rows());
+        assert_eq!(s.total_pages() * PagePool::item_size(), s.page_size);
+
+        // From here on steady scrolling never goes through the pool: every
+        // retired page comes back as the next new one.
+        for _ in 0..8 * page_rows {
+            s.grow().unwrap();
+            assert_eq!(pool_live, s.pool.pages.live());
+            assert_eq!(pool_free, s.pool.pages.free_count());
+        }
+    }
+
+    #[test]
+    fn page_list_retired_page_reuse_keeps_history_pins_and_viewport_exact() {
+        let cols: CellCountInt = 200;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+        let opts = Options {
+            cols,
+            rows: 5,
+            max_lines: Some(page_rows + page_rows / 3),
+            ..Default::default()
+        };
+
+        // The reference list gives every retired page back to the pool at
+        // once, which is what pruning did before the spare existed. Both
+        // lists see the same operations and must stay indistinguishable.
+        // lists[0] is the list under test, lists[1] the reference.
+        let mut lists = [init_opts(opts), init_opts(opts)];
+        let mut pins: Vec<[PinPtr; 2]> = Vec::new();
+
+        let mut reused: usize = 0;
+        for i in 0..6 * page_rows {
+            for l in lists.iter_mut() {
+                let spare = l.spare_node;
+                if let Some(node) = l.grow().unwrap() {
+                    if spare == Some(node) {
+                        reused += 1;
+                    }
+                }
+
+                // Mark each new row with one cell whose column moves, so
+                // stale cells left in a reused page could not hide.
+                let cell = l
+                    .get_cell(pt_active((i % cols as usize) as CellCountInt, l.rows as u32 - 1))
+                    .unwrap();
+                unsafe { *cell.cell = cpu(0x100 + i as u32) };
+            }
+            lists[1].release_spare(SpareRelease::Decommit);
+
+            // Pin history rows and scroll back into history at a few points,
+            // so pruning has pins and a viewport pin to remap.
+            if i == page_rows / 2 || i == 2 * page_rows {
+                let mut pair = [NonNull::dangling(); 2];
+                for (j, l) in lists.iter_mut().enumerate() {
+                    pair[j] = l.track_pin(l.pin(pt_screen(0, 3)).unwrap()).unwrap();
+                }
+                pins.push(pair);
+            }
+            if i == page_rows / 2 || i == 3 * page_rows {
+                for l in lists.iter_mut() {
+                    let p = l.pin(pt_screen(0, 7)).unwrap();
+                    l.scroll(Scroll::Pin(p));
+                }
+            }
+
+            let [s, r] = &mut lists;
+            assert_eq!(r.total_rows, s.total_rows);
+            assert_eq!(r.total_pages(), s.total_pages());
+            assert_eq!(r.page_size, s.page_size);
+            assert_eq!(r.viewport, s.viewport);
+            assert_eq!(r.scrollbar(), s.scrollbar());
+            for pair in &pins {
+                assert_eq!(tp(pair[1]).garbage, tp(pair[0]).garbage);
+                assert_eq!(
+                    r.point_from_pin(Tag::Screen, *tp(pair[1])),
+                    s.point_from_pin(Tag::Screen, *tp(pair[0]))
+                );
+            }
+        }
+
+        // The spare really was used, and the reference never used it.
+        assert!(reused >= 4);
+        assert!(lists[1].spare_node.is_none());
+
+        // Every retained row holds exactly what was written to it.
+        let mut it_s = lists[0].row_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        let mut it_ref = lists[1].row_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        while let Some(p_ref) = it_ref.next() {
+            let p_s = it_s.next().unwrap();
+            assert_eq!(pin_rac(p_ref).0.wrap(), pin_rac(p_s).0.wrap());
+            for (a, b) in pin_cells(p_ref, CellSubset::All)
+                .iter()
+                .zip(pin_cells(p_s, CellSubset::All).iter())
+            {
+                assert_eq!(a.codepoint(), b.codepoint());
+            }
+        }
+        assert!(it_s.next().is_none());
+
+        for pair in pins {
+            for (l, p) in lists.iter_mut().zip(pair) {
+                l.untrack_pin(p);
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_retired_page_comes_back_blank() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 24,
+            max_lines: Some(page_rows + page_rows / 2),
+            ..Default::default()
+        });
+        while s.pages.first == s.pages.last {
+            s.grow().unwrap();
+        }
+
+        // Dirty everything a page can carry: cells, row flags, a style, and
+        // a grapheme.
+        let first_node = first(&s);
+        {
+            let page = pg(first_node);
+            let mut bold = stylepkg::Style::default();
+            bold.flags.bold = true;
+            let style_id = unsafe { page.styles.add(page.memory, bold) }.unwrap();
+            for y in 0..page.size.rows as usize {
+                let row = row_at(page, y);
+                row.set_wrap(true);
+                row.set_wrap_continuation(true);
+                row.set_styled(true);
+                row.set_semantic_prompt(SemanticPrompt::Prompt);
+                for cell in cells_of(page, row) {
+                    let mut c = cp('A');
+                    c.set_style_id(style_id);
+                    *cell = c;
+                    unsafe { page.styles.use_(page.memory, style_id) };
+                }
+            }
+            unsafe { page.styles.release(page.memory, style_id) };
+
+            let (row, cell) = rac(page, 0, 0);
+            page.append_grapheme(row, cell, 0x0301).unwrap();
+            assert_eq!(1, page.styles.count());
+        }
+
+        let mut reused: Option<NodePtr> = None;
+        while reused.is_none() {
+            reused = s.grow().unwrap();
+        }
+        assert_eq!(first_node, reused.unwrap());
+
+        // The rebuilt page is what a fresh pool buffer would give: row headers
+        // point at their cells, every other byte of the item is zero.
+        let page = pg(first_node);
+        let layout = Page::layout(page.capacity);
+        let rows = unsafe { core::slice::from_raw_parts(page.rows.ptr(page.memory), page.capacity.rows as usize) };
+        for row in rows {
+            assert_eq!(Row::init(row.cells()), *row);
+        }
+        let item = unsafe { core::slice::from_raw_parts(page.memory.ptr(), std_size()) };
+        assert!(item[layout.cells_start..].iter().all(|&b| b == 0));
+        assert_eq!(0, page.styles.count());
+        page.assert_integrity();
+    }
+
+    #[test]
+    fn page_list_compress_reset_and_deinit_give_back_the_spare_page() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 24,
+            max_lines: Some(page_rows + page_rows / 2),
+            ..Default::default()
+        });
+
+        // Prune once so the spare holds the retired first page.
+        let retire = |l: &mut PageList| {
+            while l.spare_node.is_none() {
+                l.grow().unwrap();
+            }
+        };
+        retire(&mut s);
+
+        // Compression is what an idle embedder calls, so it returns the
+        // spare to the pool decommitted before compressing anything.
+        let free = s.pool.pages.free_count();
+        let _ = s.compress(CompressMode::Incremental);
+        assert!(s.spare_node.is_none());
+        assert_eq!(free + 1, s.pool.pages.free_count());
+
+        // A page taken after that comes from the pool.
+        let mut node: Option<NodePtr> = None;
+        while node.is_none() {
+            node = s.grow().unwrap();
+        }
+        assert_eq!(free, s.pool.pages.free_count());
+
+        // Reset drops the spare along with every page.
+        retire(&mut s);
+        s.reset();
+        assert!(s.spare_node.is_none());
+
+        // Drop releases a spare still held (the page pool asserts that
+        // every item came back).
+        retire(&mut s);
+        assert!(s.spare_node.is_some());
+    }
+
+    #[test]
+    fn page_list_does_not_keep_a_compressed_page_as_the_spare() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 24,
+            max_lines: Some(2 * page_rows + page_rows / 2),
+            ..Default::default()
+        });
+        while s.total_rows - (s.rows as usize) < s.limits.max(LimitKey::Lines) {
+            s.grow().unwrap();
+        }
+
+        // Idle compression leaves the cold history compressed and decommitted.
+        assert_eq!(IncrementalCompressionResult::Complete, s.compress(CompressMode::Drain));
+        let first_node = first(&s);
+        assert!(n(first_node).is_compressed());
+
+        // Pruning a compressed page frees it: its memory is already back with
+        // the OS, so there is nothing to keep warm.
+        let free = s.pool.pages.free_count();
+        s.grow().unwrap();
+        assert!(first(&s) != first_node);
+        assert!(s.spare_node.is_none());
+        assert_eq!(free + 1, s.pool.pages.free_count());
+    }
+
+    #[test]
+    fn page_list_clear_history_does_not_keep_a_spare_page() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init(cols, 24);
+        s.grow_rows(3 * page_rows).unwrap();
+        let pages = s.total_pages();
+
+        // Only limit pruning keeps a page warm. Clearing history is not
+        // followed by steady growth, so every erased page goes to the pool.
+        let free = s.pool.pages.free_count();
+        s.erase_history(None);
+        assert!(s.spare_node.is_none());
+        assert_eq!(free + pages - s.total_pages(), s.pool.pages.free_count());
+    }
+
+    #[test]
+    fn page_list_is_zero_checks_every_byte() {
+        let mut buf = [0u8; 100];
+        assert!(is_zero(&buf));
+        assert!(is_zero(&buf[0..0]));
+        for i in 0..buf.len() {
+            buf[i] = 0x80;
+            assert!(!is_zero(&buf));
+            buf[i] = 0;
+        }
+    }
+
+    #[test]
+    fn page_list_compress_trims_the_last_page_until_it_grows() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        let last_node = last(&s);
+        assert!(n(last_node).rows() < n(last_node).capacity().rows);
+        let _ = s.compress(CompressMode::Incremental);
+        assert!(n(last_node).trimmed);
+
+        // Unused rows still read as zero, wherever their cell blocks are.
+        {
+            let page = pg(last_node);
+            let rows = unsafe { core::slice::from_raw_parts(page.rows.ptr(page.memory), page.capacity.rows as usize) };
+            for row in &rows[page.size.rows as usize..] {
+                let cells = unsafe { core::slice::from_raw_parts(row.cells().ptr(page.memory), page.capacity.cols as usize) };
+                for cell in cells {
+                    assert!(cell.is_zero());
+                }
+            }
+        }
+
+        // Growing recommits them before it exposes the next row.
+        s.grow().unwrap();
+        assert!(!n(last_node).trimmed);
+
+        // A full last page has nothing to trim.
+        while n(last(&s)).rows() < n(last(&s)).capacity().rows {
+            s.grow().unwrap();
+        }
+        let _ = s.compress(CompressMode::Incremental);
+        assert!(!n(last(&s)).trimmed);
+    }
+
+    #[test]
+    fn page_list_compress_trim_keeps_cells_of_rows_moved_by_erase_history() {
+        let cases: [(usize, bool); 3] = [
+            (100, false),
+            (100, true),
+            (initial_capacity(80).rows as usize - 24, true),
+        ];
+        for (history, swap_rows) in cases {
+            let mut s = init(80, 24);
+            s.grow_rows(history).unwrap();
+            assert!(s.pages.first == s.pages.last);
+
+            s.erase_history(None);
+            let last_node = last(&s);
+            assert!(first(&s) == last_node);
+            assert!(n(last_node).rows() < n(last_node).capacity().rows);
+
+            let page = pg(last_node);
+            let rows = unsafe { core::slice::from_raw_parts_mut(page.rows.ptr(page.memory), page.size.rows as usize) };
+            // Cover the highest live block at both ends of the row headers.
+            if swap_rows {
+                let len = rows.len();
+                rows.swap(0, len - 1);
+            }
+            for (y, row) in rows.iter().enumerate() {
+                for cell in cells_of(page, row) {
+                    *cell = cpu('A' as u32 + y as u32);
+                }
+            }
+
+            let layout = Page::layout(page.capacity);
+            let base = page.memory.ptr() as usize;
+            let highest = rows[if swap_rows { 0 } else { rows.len() - 1 }].cells().ptr(page.memory);
+            let start = (unsafe { highest.add(page.capacity.cols as usize) } as usize).next_multiple_of(PAGE_SIZE_MIN);
+            let end = (base + layout.cells_start + layout.cells_size) / PAGE_SIZE_MIN * PAGE_SIZE_MIN;
+
+            let _ = s.compress(CompressMode::Incremental);
+            assert_eq!(start < end, n(last_node).trimmed);
+
+            for (y, row) in rows.iter().enumerate() {
+                let cells = cells_of(page, row);
+                let lo = cells.as_ptr() as usize;
+                let hi = lo + page.capacity.cols as usize * core::mem::size_of::<PCell>();
+                assert!(hi <= start || lo >= end);
+                for cell in cells.iter() {
+                    assert_eq!('A' as u32 + y as u32, cell.codepoint());
+                }
+            }
+
+            // Repeated idle compression preserves the same live blocks.
+            let _ = s.compress(CompressMode::Incremental);
+            for (y, row) in rows.iter().enumerate() {
+                for cell in cells_of(page, row).iter() {
+                    assert_eq!('A' as u32 + y as u32, cell.codepoint());
+                }
+            }
+            s.grow().unwrap();
+            assert!(!n(last_node).trimmed);
+            let page = pg(last_node);
+            for cell in cells_of(page, row_at(page, page.size.rows as usize - 1)).iter() {
+                assert!(cell.is_zero());
+            }
+        }
     }
 
     #[test]
@@ -14610,6 +15649,7 @@ mod tests {
                 top: pt_active(0, 5),
                 bot: None,
                 tracked_pins: Some(&mut pin_remap),
+                cow: false,
             })
             .unwrap();
 
@@ -14635,6 +15675,7 @@ mod tests {
                 top: pt_active(0, 5),
                 bot: None,
                 tracked_pins: Some(&mut pin_remap),
+                cow: false,
             })
             .unwrap();
 
@@ -19086,5 +20127,335 @@ mod tests {
         }
         assert_eq!(extra_len, counting.allocations());
         assert_eq!(0, counting.deallocations());
+    }
+
+    // -----------------------------------------------------------------
+    // Copy-on-write clones
+    // -----------------------------------------------------------------
+
+    fn cow_opts<'a>() -> Clone<'a> {
+        Clone {
+            top: pt_screen(0, 0),
+            bot: None,
+            tracked_pins: None,
+            cow: true,
+        }
+    }
+
+    /// Zig: `pin.rowAndCellRead().cell.codepoint()`.
+    fn read_cp(p: Pin) -> u32 {
+        unsafe { (*p.row_and_cell_read().cell).codepoint() }
+    }
+
+    fn set_cell(s: &PageList, pt: Point, c: char) {
+        *pin_rac(s.pin(pt).unwrap()).1 = cp(c);
+    }
+
+    fn compressed_page<'a>(node: NodePtr) -> &'a mut compression::Page {
+        match &mut n(node).data {
+            NodeData::Compressed(c) => c,
+            NodeData::Resident(_) => panic!("node is resident"),
+        }
+    }
+
+    fn shared_refs(shared: NonNull<SharedResident>) -> usize {
+        unsafe { shared.as_ref() }.references.load(Ordering::Acquire)
+    }
+
+    fn encoded_refs(node: NodePtr) -> usize {
+        unsafe { compressed_page(node).shared.as_ref() }.references.load(Ordering::Acquire)
+    }
+
+    fn history_list() -> PageList {
+        let mut s = init_opts(Options {
+            cols: 180,
+            rows: 24,
+            max_lines: Some(2000),
+            ..Default::default()
+        });
+        for _ in 0..1000 {
+            s.grow().unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn copy_on_write_small_active_clone_avoids_standard_page_backing() {
+        let source = init(180, 50);
+        set_cell(&source, pt_active(0, 0), 'A');
+        set_cell(&source, pt_active(179, 49), 'Z');
+        let before = source.memory_stats();
+        let mut frozen = source.clone(cow_opts()).unwrap();
+        let captured = frozen.memory_stats();
+        assert_eq!(source.total_rows, frozen.total_rows);
+        assert!(captured.resident_backing_bytes <= before.resident_backing_bytes / 2);
+        set_cell(&source, pt_active(179, 49), 'X');
+        assert_eq!('A' as u32, read_cp(frozen.pin(pt_active(0, 0)).unwrap()));
+        assert_eq!('Z' as u32, read_cp(frozen.pin(pt_active(179, 49)).unwrap()));
+        frozen
+            .resize(Resize {
+                cols: Some(180),
+                rows: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!('A' as u32, read_cp(frozen.pin(pt_screen(0, 0)).unwrap()));
+        assert_eq!('Z' as u32, read_cp(frozen.pin(pt_screen(179, 49)).unwrap()));
+        drop(source);
+    }
+
+    #[test]
+    fn copy_on_write_anchored_frozen_resident_reflow_borrows_shared_input_without_detaching() {
+        let rejecting = FailingAllocator::leak_over(0, &OS_PAGE_ALLOCATOR);
+        let mut source = history_list();
+        set_cell(&source, pt_screen(0, 0), 'A');
+        set_cell(&source, pt_screen(90, 0), 'B');
+        set_cell(&source, pt_screen(179, 0), 'Z');
+        set_cell(&source, pt_active(0, 23), 'C');
+        let source_total = source.total_rows;
+        let source_first = first(&source);
+        let source_memory = n(source_first).metadata().memory.ptr();
+        let mut frozen = source.clone(cow_opts()).unwrap();
+        let anchor = frozen.track_pin(frozen.pin(pt_active(0, 23)).unwrap()).unwrap();
+        let grown_rows = (frozen.total_rows - n(first(&frozen)).rows() as usize) as CellCountInt;
+        let future_active_top = frozen
+            .pin(pt_screen(0, (frozen.total_rows - grown_rows as usize) as u32))
+            .unwrap();
+        assert!(n(future_active_top.node).shared.is_some());
+        let mut shared_pages: usize = 0;
+        let mut node_it = source.pages.first;
+        while let Some(node) = node_it {
+            if let Some(shared) = n(node).shared {
+                assert_eq!(2, shared_refs(shared));
+                unsafe { (*shared.as_ptr()).page_alloc = rejecting.allocator() };
+                shared_pages += 1;
+            }
+            node_it = n(node).next;
+        }
+        assert!(shared_pages > 1);
+        frozen
+            .resize(Resize {
+                cols: Some(90),
+                rows: Some(grown_rows),
+                cursor: Some(ResizeCursor {
+                    x: 0,
+                    y: 23,
+                    pin: Some(anchor),
+                }),
+                pull_scrollback: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(0, rejecting.allocations());
+        assert!(!rejecting.has_induced_failure());
+        assert_eq!(180, source.cols);
+        assert_eq!(source_total, source.total_rows);
+        assert_eq!(source_first, first(&source));
+        assert_eq!(source_memory, n(source_first).metadata().memory.ptr());
+        assert_eq!('A' as u32, read_cp(frozen.pin(pt_screen(0, 0)).unwrap()));
+        assert_eq!('B' as u32, read_cp(frozen.pin(pt_screen(0, 1)).unwrap()));
+        assert_eq!('Z' as u32, read_cp(frozen.pin(pt_screen(89, 1)).unwrap()));
+        assert_eq!('C' as u32, read_cp(*tp(anchor)));
+        assert_eq!(
+            source_total as u32,
+            frozen.point_from_pin(Tag::Screen, *tp(anchor)).unwrap().coord().y
+        );
+        let mut node_it = source.pages.first;
+        while let Some(node) = node_it {
+            if let Some(shared) = n(node).shared {
+                assert_eq!(1, shared_refs(shared));
+                unsafe { (*shared.as_ptr()).page_alloc = source.pool.pages.allocator };
+            }
+            node_it = n(node).next;
+        }
+        set_cell(&source, pt_screen(0, 0), 'X');
+        assert_eq!('X' as u32, read_cp(source.pin(pt_screen(0, 0)).unwrap()));
+        source.erase_history(None);
+        assert_eq!('C' as u32, read_cp(*tp(anchor)));
+        assert_eq!('A' as u32, read_cp(frozen.pin(pt_screen(0, 0)).unwrap()));
+        assert_eq!('Z' as u32, read_cp(frozen.pin(pt_screen(89, 1)).unwrap()));
+        frozen.untrack_pin(anchor);
+    }
+
+    #[test]
+    fn copy_on_write_resident_page_clone_survives_reflow_and_clear_history() {
+        let mut source = history_list();
+        set_cell(&source, pt_screen(0, 0), 'A');
+        let frozen = source.clone(cow_opts()).unwrap();
+        assert!(n(first(&source)).shared.is_some());
+        assert_eq!(n(first(&source)).shared, n(first(&frozen)).shared);
+        let total = frozen.total_rows;
+        source
+            .resize(Resize {
+                cols: Some(90),
+                rows: Some(12),
+                ..Default::default()
+            })
+            .unwrap();
+        source.erase_history(None);
+        assert_eq!(total, frozen.total_rows);
+        assert_eq!('A' as u32, unsafe {
+            (*frozen.pin(pt_screen(0, 0)).unwrap().row_and_cell().cell).codepoint()
+        });
+    }
+
+    #[test]
+    fn copy_on_write_compressed_clones_share_encoding_and_map_on_first_read() {
+        let mut source = history_list();
+        set_cell(&source, pt_screen(0, 0), 'A');
+        let _ = source.compress(CompressMode::Full);
+        assert!(n(first(&source)).is_compressed());
+        let frozen = source.clone(cow_opts()).unwrap();
+        let left = compressed_page(first(&source));
+        let right = compressed_page(first(&frozen));
+        assert_eq!(left.encoded as *mut u8, right.encoded as *mut u8);
+        assert_eq!(0, right.page.memory.len());
+        assert_eq!(left.raw_len, right.raw_len);
+        source.erase_history(None);
+        assert_eq!('A' as u32, unsafe {
+            (*frozen.pin(pt_screen(0, 0)).unwrap().row_and_cell().cell).codepoint()
+        });
+    }
+
+    #[test]
+    fn copy_on_write_unread_compressed_clone_teardown_never_allocates_raw_mappings() {
+        let mut source = init_opts(Options {
+            cols: 180,
+            rows: 24,
+            max_lines: Some(2000),
+            ..Default::default()
+        });
+        let page_rows = initial_capacity(source.cols).rows as usize;
+        for _ in 0..page_rows * 4 {
+            source.grow().unwrap();
+        }
+        assert!((n(last(&source)).rows() as usize) < page_rows);
+        set_cell(&source, pt_screen(0, 0), 'A');
+        let _ = source.compress(CompressMode::Full);
+        let before = source.memory_stats();
+        assert!(before.compressed_pages > 1);
+        let pool_live = source.pool.pages.live();
+        let mut frozen = source.clone(cow_opts()).unwrap();
+        let captured = frozen.memory_stats();
+        assert_eq!(before.compressed_pages, captured.compressed_pages);
+        assert!(captured.raw_bytes < before.raw_bytes);
+        assert_eq!(before.decommitted_raw_bytes, captured.unmapped_raw_bytes);
+        assert_eq!(0, captured.decommitted_raw_bytes);
+        assert_eq!(captured.resident_backing_bytes, captured.reserved_backing_bytes);
+        assert_eq!(frozen.page_size, captured.reserved_backing_bytes + captured.unmapped_raw_bytes);
+        let rejecting = FailingAllocator::leak_over(0, &OS_PAGE_ALLOCATOR);
+        frozen.pool.pages.allocator = rejecting.allocator();
+        let mut node_it = frozen.pages.first;
+        while let Some(node) = node_it {
+            if n(node).is_compressed() {
+                let c = compressed_page(node);
+                assert_eq!(0, c.page.memory.len());
+                assert!(c.raw_len > 0);
+                c.mapping_alloc = Some(rejecting.allocator());
+            }
+            node_it = n(node).next;
+        }
+        encoded(first(&frozen)).fill(0xFF);
+        drop(frozen);
+        assert_eq!(0, rejecting.allocations());
+        assert!(!rejecting.has_induced_failure());
+        assert_eq!(pool_live, source.pool.pages.live());
+        assert_eq!(before, source.memory_stats());
+        assert_eq!(Owned::Pool, n(first(&source)).owned);
+    }
+
+    #[test]
+    fn copy_on_write_nested_compressed_clones_preserve_metadata_and_allocate_only_read_pages() {
+        let mut source = history_list();
+        set_cell(&source, pt_screen(0, 0), 'A');
+        let _ = source.compress(CompressMode::Full);
+        let frozen = source.clone(cow_opts()).unwrap();
+        let nested = frozen.clone(cow_opts()).unwrap();
+        let frozen_node = first(&frozen);
+        let nested_node = first(&nested);
+        let raw_len = n(frozen_node).raw_len();
+        let encoded_ptr = compressed_page(frozen_node).encoded as *mut u8;
+        assert_eq!(encoded_ptr, compressed_page(nested_node).encoded as *mut u8);
+        assert_eq!(3, encoded_refs(frozen_node));
+        assert_eq!(0, compressed_page(frozen_node).page.memory.len());
+        assert_eq!(0, compressed_page(nested_node).page.memory.len());
+        assert_eq!(n(first(&source)).rows(), n(frozen_node).rows());
+        assert_eq!(n(first(&source)).cols(), n(frozen_node).cols());
+        assert_eq!(n(first(&source)).capacity(), n(frozen_node).capacity());
+        let before = frozen.memory_stats();
+        assert_eq!(before, nested.memory_stats());
+        let mut expected_page_size: usize = 0;
+        let mut node_it = frozen.pages.first;
+        while let Some(node) = node_it {
+            expected_page_size += match n(node).owned {
+                Owned::Pool => PagePool::item_size(),
+                Owned::Heap => n(node).raw_len(),
+            };
+            node_it = n(node).next;
+        }
+        assert_eq!(expected_page_size, frozen.page_size);
+        drop(source);
+        assert_eq!(2, encoded_refs(frozen_node));
+        {
+            let mut preserved = n(frozen_node).page_preserving_state(Allocator::GLOBAL).unwrap();
+            let page = preserved.page();
+            assert_eq!('A' as u32, unsafe { (*page.get_row_and_cell(0, 0).cell).codepoint() });
+            preserved.deinit();
+        }
+        assert_eq!(0, compressed_page(frozen_node).page.memory.len());
+        assert_eq!(before, frozen.memory_stats());
+        let counted = FailingAllocator::leak_over(usize::MAX, &OS_PAGE_ALLOCATOR);
+        compressed_page(frozen_node).mapping_alloc = Some(counted.allocator());
+        let cell = frozen.pin(pt_screen(0, 0)).unwrap().row_and_cell().cell;
+        assert_eq!('A' as u32, unsafe { (*cell).codepoint() });
+        assert_eq!(1, counted.allocations());
+        assert_eq!(raw_len, counted.allocated_bytes());
+        let restored = frozen.memory_stats();
+        assert_eq!(before.raw_bytes, restored.raw_bytes);
+        assert_eq!(before.unmapped_raw_bytes - raw_len, restored.unmapped_raw_bytes);
+        assert_eq!(before.resident_raw_bytes + raw_len, restored.resident_raw_bytes);
+        assert_eq!(before.reserved_backing_bytes + raw_len, restored.reserved_backing_bytes);
+        assert_eq!(frozen.page_size, restored.reserved_backing_bytes + restored.unmapped_raw_bytes);
+        assert_eq!(before.resident_pages + 1, restored.resident_pages);
+        assert_eq!(before.compressed_pages - 1, restored.compressed_pages);
+        assert_eq!(before, nested.memory_stats());
+        unsafe { *cell = cp('X') };
+        assert_eq!('A' as u32, unsafe {
+            (*nested.pin(pt_screen(0, 0)).unwrap().row_and_cell().cell).codepoint()
+        });
+        assert_eq!('X' as u32, unsafe {
+            (*frozen.pin(pt_screen(0, 0)).unwrap().row_and_cell().cell).codepoint()
+        });
+    }
+
+    #[test]
+    fn copy_on_write_destroying_unmapped_compressed_nodes_preserves_logical_page_accounting() {
+        let mut source = history_list();
+        let _ = source.compress(CompressMode::Full);
+        let mut frozen = source.clone(cow_opts()).unwrap();
+        let rejecting = FailingAllocator::leak_over(0, &OS_PAGE_ALLOCATOR);
+        let mut node_it = frozen.pages.first;
+        let mut removed: usize = 0;
+        let mut removed_rows: usize = 0;
+        let before_size = frozen.page_size;
+        while let Some(node) = node_it {
+            node_it = n(node).next;
+            if !n(node).is_compressed() {
+                continue;
+            }
+            assert_eq!(0, compressed_page(node).page.memory.len());
+            compressed_page(node).mapping_alloc = Some(rejecting.allocator());
+            removed += n(node).raw_len();
+            removed_rows += n(node).rows() as usize;
+            unsafe { frozen.pages.remove(node) };
+            frozen.destroy_node(node);
+        }
+        frozen.total_rows -= removed_rows;
+        *tp(frozen.viewport_pin) = Pin::new(first(&frozen));
+        assert!(removed > 0);
+        assert_eq!(before_size - removed, frozen.page_size);
+        assert_eq!(0, frozen.memory_stats().unmapped_raw_bytes);
+        assert_eq!(0, rejecting.allocations());
+        assert!(!rejecting.has_induced_failure());
     }
 }

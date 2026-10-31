@@ -58,6 +58,12 @@ impl Key {
 pub struct ScreenPtr(NonNull<Screen>);
 
 impl ScreenPtr {
+    /// Take ownership of a screen for a set built around it (Zig: a
+    /// `ScreenSet` literal over an `alloc.create(Screen)`). The set frees it.
+    pub fn from_box(screen: Box<Screen>) -> ScreenPtr {
+        ScreenPtr(NonNull::from(Box::leak(screen)))
+    }
+
     /// The raw pointer.
     #[inline]
     pub fn as_ptr(self) -> *mut Screen {

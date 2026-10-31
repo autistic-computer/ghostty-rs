@@ -53,6 +53,13 @@ pub struct PageMemory {
 }
 
 impl PageMemory {
+    /// No memory (Zig: `&.{}`), for page metadata whose mapping is not
+    /// allocated yet.
+    pub const EMPTY: PageMemory = PageMemory {
+        ptr: NonNull::dangling(),
+        len: 0,
+    };
+
     /// Create from a raw pointer and length.
     ///
     /// # Safety

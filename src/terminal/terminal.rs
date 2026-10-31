@@ -893,7 +893,19 @@ impl Terminal {
             kitty_image_loading_limits: opts.kitty_image_loading_limits.clone(),
         })?;
 
-        let mut result = Terminal {
+        let mut result = Self::init_with_screen_set(opts, screen_set)?;
+        result.set_cursor_style(ansi::CursorStyle::Default);
+        Ok(result)
+    }
+
+    /// Initialize a terminal around an existing screen set, such as a
+    /// copy-on-write screen clone. Unlike `init` this keeps the screens'
+    /// cursor style as it is. `opts.cols` and `opts.rows` must be nonzero
+    /// and match the screens.
+    pub fn init_with_screen_set(opts: Options, screen_set: ScreenSet) -> Result<Terminal, InitError> {
+        let cols = opts.cols;
+        let rows = opts.rows;
+        let result = Terminal {
             cols,
             rows,
             screens: screen_set,
@@ -925,10 +937,11 @@ impl Terminal {
             mouse_shape: mouse::Shape::Text,
             glyph_glossary: glyph::Glossary::empty(),
             kitty_dnd: None,
-            flags: Flags::default(),
+            flags: Flags {
+                xt_checksum: opts.default_xt_checksum,
+                ..Flags::default()
+            },
         };
-        result.flags.xt_checksum = opts.default_xt_checksum;
-        result.set_cursor_style(ansi::CursorStyle::Default);
         Ok(result)
     }
 
@@ -5305,6 +5318,60 @@ mod tests {
             t.linefeed().unwrap();
         }
         assert!(primary.pages.total_rows - primary.pages.rows as usize > page_rows);
+    }
+
+    #[test]
+    fn terminal_line_limited_history_stays_exact_while_pages_are_reused() {
+        let mut t = Terminal::init(Options {
+            cols: 200,
+            rows: 4,
+            max_scrollback_bytes: None,
+            max_scrollback_lines: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let primary = t.screens.get(ScreenKey::Primary).unwrap();
+        let page_rows: usize = nd(primary.pages.pages.first.unwrap()).capacity().rows as usize;
+        let max_lines = page_rows + page_rows / 3;
+        t.set_scrollback_max_lines(Some(max_lines));
+
+        // Print numbered lines until several pages have been retired and
+        // reused, varying line lengths so a reused row that kept old cells
+        // would show up as trailing garbage.
+        let total = 5 * page_rows + 7;
+        for i in 0..total {
+            t.print_string(&format!("{i}:")).unwrap();
+            for _ in 0..i % 150 {
+                t.print('x' as u32).unwrap();
+            }
+            t.print_string("\n").unwrap();
+        }
+
+        // History is whole-page pruned, so it sits just under the limit.
+        let history = primary.pages.total_rows - primary.pages.rows as usize;
+        assert!(history <= max_lines);
+        assert!(history > max_lines - page_rows);
+
+        // Everything retained reads back as consecutive lines, and the rows
+        // after the last line are blank.
+        let text = t
+            .screens
+            .active
+            .dump_string_alloc(Point::Screen(Coordinate::default()))
+            .unwrap();
+        let mut it = text.split('\n');
+        let first_line = total + 1 - primary.pages.total_rows;
+        for i in first_line..total {
+            let line = it.next().unwrap();
+            let colon = line.find(':').unwrap();
+            assert_eq!(i, line[..colon].parse::<usize>().unwrap());
+            assert_eq!(i % 150, line.len() - colon - 1);
+            assert!(line[colon + 1..].bytes().all(|c| c == b'x'));
+        }
+        for line in it {
+            assert_eq!(0, line.len());
+        }
     }
 
     #[test]

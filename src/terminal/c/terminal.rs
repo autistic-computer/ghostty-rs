@@ -56,7 +56,7 @@ use crate::terminal::osc::program_status;
 use crate::terminal::osc::semantic_prompt as osc_sp;
 use crate::terminal::page_list::{ScrollbarC, PageList};
 use crate::terminal::point;
-use crate::terminal::screen_set::Key as ScreenKey;
+use crate::terminal::screen_set::{Key as ScreenKey, ScreenPtr, ScreenSet};
 use crate::terminal::size::CellCountInt;
 use crate::terminal::size_report;
 use crate::terminal::snapshot::snapshot as snapshot_core;
@@ -1454,6 +1454,72 @@ fn new_(alloc_: std::option::Option<&CAllocator>, cols: CellCountInt, rows: Cell
     t.flags.shell_redraws_prompt = osc_sp::Redraw::False;
 
     wrap(alloc, Box::new(t), io, DEFAULT_CONTINUATION_MAX_BYTES).map_err(|_| NewError::OutOfMemory)
+}
+
+/// C: ghostty_terminal_clone_screen
+///
+/// Clone the active screen of `terminal_` copy-on-write into a new terminal
+/// that owns its pages, cursor and parser. The clone uses the default
+/// allocator and outlives the source.
+///
+/// # Safety
+/// `terminal_` must be NULL or a live terminal handle.
+#[export_name = "ghostty_terminal_clone_screen"]
+pub unsafe extern "C" fn clone_screen(terminal_: Terminal, result: &mut Terminal) -> Result {
+    *result = std::ptr::null_mut();
+    let Some(source) = zig_terminal(terminal_) else {
+        return Result::InvalidValue;
+    };
+    match clone_screen_(source) {
+        Ok(cloned) => {
+            *result = cloned;
+            Result::Success
+        }
+        Err(OutOfMemory) => Result::OutOfMemory,
+    }
+}
+
+/// (Zig: `cloneScreen`.)
+fn clone_screen_(source: &mut ZigTerminal) -> std::result::Result<Terminal, OutOfMemory> {
+    let alloc = HandleAllocator::new(None);
+    let io = Io::INIT;
+    let cloned = {
+        let mut screen = source.screens.active.clone_preserving().map_err(|_| OutOfMemory)?;
+        screen.no_scrollback = false;
+        let screen = ScreenPtr::from_box(Box::new(screen));
+        let target = ZigTerminal::init_with_screen_set(
+            zig_terminal::Options {
+                cols: source.cols,
+                rows: source.rows,
+                ..Default::default()
+            },
+            ScreenSet {
+                active_key: ScreenKey::Primary,
+                active: screen,
+                all: [Some(screen), None],
+                generations: [0; ScreenKey::COUNT],
+            },
+        )
+        .map_err(|_| OutOfMemory)?;
+        wrap(alloc, Box::new(target), io, DEFAULT_CONTINUATION_MAX_BYTES)?
+    };
+    // SAFETY: freshly created handle.
+    let target = unsafe { (*cloned).terminal_mut() };
+    target.colors.background = source.colors.background;
+    target.colors.foreground = source.colors.foreground;
+    target.colors.cursor = source.colors.cursor;
+    target.colors.palette.change_default(*source.colors.palette.original());
+    target.colors.palette.current = source.colors.palette.current;
+    target.colors.palette.mask = source.colors.palette.mask;
+    target.flags = source.flags;
+    target.flags.shell_redraws_prompt = osc_sp::Redraw::False;
+    target.flags.resize_pull_scrollback = true;
+    target.modes = source.modes;
+    target.modes.set(Mode::Wraparound, true);
+    target.cursor = source.cursor;
+    target.title.extend_from_slice(&source.title);
+    target.pwd.extend_from_slice(&source.pwd);
+    Ok(cloned)
 }
 
 /// C: ghostty_terminal_vt_write
@@ -3686,7 +3752,11 @@ pub(crate) mod tests {
 
         let compressed = memory_usage(t);
         assert_eq!(history.primary_pages, compressed.primary_pages);
-        assert_eq!(history.primary_virtual_bytes, compressed.primary_virtual_bytes);
+        // Compression borrows a free pool item as scratch. With none free the
+        // pool allocates one, which stays in the pool afterward. A fresh
+        // terminal holds exactly one pool item, so it gives the item size.
+        let grown = compressed.primary_virtual_bytes - history.primary_virtual_bytes;
+        assert!(grown == 0 || grown == fresh.primary_virtual_bytes);
         if compressed.compression_supported {
             assert!(compressed.primary_compressed_pages > 0);
             assert!(compressed.primary_compressed_bytes > 0);
@@ -7004,6 +7074,106 @@ pub(crate) mod tests {
         assert_eq!(Result::InvalidValue, unsafe {
             get_multi(std::ptr::null_mut(), 1, std::ptr::null(), values.as_ptr(), std::ptr::null_mut())
         });
+    }
+
+    #[test]
+    fn copy_on_write_terminal_clone_preserves_cursor_defaults_and_fresh_parser_after_source_drop() {
+        let source = new_t(12, 4);
+        let default_style = TerminalCursorStyle::Underline;
+        let default_blink = true;
+        assert_eq!(Result::Success, sopt(source, Option::DefaultCursorStyle, p(&default_style)));
+        assert_eq!(Result::Success, sopt(source, Option::DefaultCursorBlink, p(&default_blink)));
+        vw(source, b"\x1b[?1049h\x1b[6 q\x1b[31mAB\x1b[");
+        assert_eq!(ScreenKey::Alternate, zt(source).screens.active_key);
+        assert_eq!(CursorStyle::Bar, zt(source).screens.active.cursor.cursor_style);
+
+        let mut frozen: Terminal = std::ptr::null_mut();
+        assert_eq!(Result::Success, unsafe { clone_screen(source, &mut frozen) });
+        let target = zt(frozen);
+        assert_eq!(ScreenKey::Primary, target.screens.active_key);
+        assert_eq!(CursorStyle::Block, target.screens.active.cursor.cursor_style);
+        assert_eq!(CursorStyle::Underline, target.cursor.default_style);
+        assert_eq!(Some(true), target.cursor.default_blink);
+        assert!(!target.cursor.is_default);
+        assert!(!target.modes.get(Mode::CursorBlinking));
+        let at = |x, y| {
+            let pin = target
+                .screens
+                .active
+                .pages
+                .pin(point::Point::Active(point::Coordinate { x, y }))
+                .unwrap();
+            unsafe { *pin.row_and_cell_read().cell }
+        };
+        let written = at(0, 0);
+        assert_eq!('A' as u32, written.codepoint());
+        assert!(written.style_id() != 0);
+
+        unsafe { free(source) };
+        vw(frozen, b"Z");
+        let cell = at(2, 0);
+        assert_eq!('Z' as u32, cell.codepoint());
+        assert_eq!(0, cell.style_id());
+        vw(frozen, b"\x1b[0 q");
+        assert_eq!(CursorStyle::Underline, target.screens.active.cursor.cursor_style);
+        assert!(target.modes.get(Mode::CursorBlinking));
+        unsafe { free(frozen) };
+    }
+
+    #[test]
+    fn clone_screen_null_terminal_returns_invalid_value() {
+        let mut frozen: Terminal = 1 as Terminal;
+        assert_eq!(Result::InvalidValue, unsafe { clone_screen(std::ptr::null_mut(), &mut frozen) });
+        assert!(frozen.is_null());
+    }
+
+    /// Dense compressed-history regression for copy snapshots with the
+    /// default allocator, through the C API: a nested clone of 10k rows of
+    /// compressed history reads every part of it after the source and the
+    /// first clone are gone.
+    #[test]
+    fn copy_on_write_dense_compressed_history_clone_reads_after_source_drop() {
+        let source = new_t(180, 50);
+        let max_bytes: usize = 230_400_000;
+        let max_lines: usize = 10_000;
+        assert_eq!(Result::Success, sopt(source, Option::ScrollbackMaxBytes, p(&max_bytes)));
+        assert_eq!(Result::Success, sopt(source, Option::ScrollbackMaxLines, p(&max_lines)));
+        let stripe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".repeat(3);
+        let mut input = Vec::with_capacity(10_050 * 182);
+        for row in 0..10_050 {
+            input.extend_from_slice(format!("{row:08} ").as_bytes());
+            input.extend_from_slice(&stripe.as_bytes()[..171]);
+            if row + 1 < 10_050 {
+                input.extend_from_slice(b"\r\n");
+            }
+        }
+        vw(source, &input);
+        let rows = zt(source).screens.active.pages.total_rows;
+        assert!(rows >= 10_000);
+        let mut compression_result = CompressionResult::Unsupported;
+        assert_eq!(Result::Success, unsafe {
+            compress(source, CompressionMode::Full as c_int, &mut compression_result)
+        });
+
+        let mut snapshot: Terminal = std::ptr::null_mut();
+        assert_eq!(Result::Success, unsafe { clone_screen(source, &mut snapshot) });
+        let mut nested: Terminal = std::ptr::null_mut();
+        assert_eq!(Result::Success, unsafe { clone_screen(snapshot, &mut nested) });
+        unsafe {
+            free(source);
+            free(snapshot);
+        }
+        let pages = &zt(nested).screens.active.pages;
+        assert_eq!(rows, pages.total_rows);
+        for row in [0, rows / 2, rows - 1] {
+            for x in [0, 8, 9, 90, 179] {
+                let pin = pages
+                    .pin(point::Point::Screen(point::Coordinate { x, y: row as u32 }))
+                    .unwrap();
+                assert_ne!(0, unsafe { (*pin.row_and_cell_read().cell).codepoint() });
+            }
+        }
+        unsafe { free(nested) };
     }
 
     #[test]

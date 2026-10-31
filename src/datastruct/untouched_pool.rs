@@ -202,6 +202,30 @@ impl<Item, const ALIGNMENT: usize, A: GlobalAlloc> UntouchedPool<Item, ALIGNMENT
         self.live -= 1;
     }
 
+    /// Stop counting a live item as part of this pool without freeing
+    /// it. The caller now owns the item and must free it with the item
+    /// allocator (or `adopt` it back).
+    pub fn disown(&mut self, item: ItemPtr<Item>) {
+        let _ = item;
+        debug_assert!(self.free.len() < self.live);
+        self.live -= 1;
+    }
+
+    /// Count an item allocated from the item allocator, with this pool's
+    /// layout, as a live item of this pool again. Reserving its free-list
+    /// slot here keeps `destroy` infallible.
+    pub fn adopt(&mut self, item: ItemPtr<Item>) -> Result<(), AllocError> {
+        let _ = item;
+        let need = self.live + 1;
+        if self.free.capacity() < need {
+            self.free
+                .try_reserve(need - self.free.len())
+                .map_err(|_| AllocError::OutOfMemory)?;
+        }
+        self.live += 1;
+        Ok(())
+    }
+
     fn alloc_item(&mut self) -> Result<ItemPtr<Item>, AllocError> {
         debug_assert!(self.free.capacity() > self.live);
         // SAFETY: LAYOUT has a non-zero size.
