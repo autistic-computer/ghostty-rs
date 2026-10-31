@@ -1172,10 +1172,10 @@ fn is_path_in_temp_dir(dir: &[u8], path: &[u8]) -> bool {
     // host passes (typically GetTempPath output) regularly differs
     // from the canonical path in case or uses 8.3 short names, and
     // resolving it covers both.
-    let Ok(real_dir) = fs::canonicalize(path_from_bytes(dir)) else {
+    let Ok(real_dir) = real_path_file(dir) else {
         return false;
     };
-    if is_path_in_dir(&path_to_bytes(&real_dir), path) {
+    if is_path_in_dir(&real_dir, path) {
         return true;
     }
 
@@ -1229,10 +1229,51 @@ fn real_path(file: &fs::File) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Through TinyIo, whose real paths drop the `\\?\` prefix the way Zig's
+/// do, so the drive-letter check in `kitty_windows` and the temporary
+/// directory prefix check both see `C:\...`.
+#[cfg(windows)]
+fn real_path(file: &fs::File) -> std::io::Result<Vec<u8>> {
+    use crate::lib::tinyio::{File, FileFlags, TinyIo};
+    use std::os::windows::io::AsRawHandle;
+    let file = File {
+        handle: file.as_raw_handle(),
+        flags: FileFlags::default(),
+    };
+    let mut buf = vec![0u8; MAX_PATH_BYTES];
+    let len = TinyIo::INIT.io().file_real_path(file, &mut buf)?;
+    buf.truncate(len);
+    Ok(buf)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn real_path(_file: &fs::File) -> std::io::Result<Vec<u8>> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
+
+/// The canonical path of the file or directory at `path`
+/// (`std.Io.Dir.cwd().realPathFile`).
+#[cfg(not(windows))]
+fn real_path_file(path: &[u8]) -> std::io::Result<Vec<u8>> {
+    Ok(path_to_bytes(&fs::canonicalize(path_from_bytes(path))?))
+}
+
+/// `fs::canonicalize` returns the verbatim `\\?\C:\...` form on Windows,
+/// which never prefix-matches what `real_path` returns, so this goes
+/// through TinyIo too.
+#[cfg(windows)]
+fn real_path_file(path: &[u8]) -> std::io::Result<Vec<u8>> {
+    use crate::lib::tinyio::{Dir, TinyIo};
+    let mut buf = vec![0u8; MAX_PATH_BYTES];
+    let len = Dir::cwd().real_path_file(TinyIo::INIT.io(), path, &mut buf)?;
+    buf.truncate(len);
+    Ok(buf)
+}
+
+/// Zig: `std.Io.Dir.max_path_bytes` on Windows, 32767 WTF-16 code units
+/// of up to 3 WTF-8 bytes each.
+#[cfg(windows)]
+const MAX_PATH_BYTES: usize = 32767 * 3 + 1;
 
 #[cfg(test)]
 pub(crate) mod test_util {
@@ -1282,12 +1323,12 @@ pub(crate) mod test_util {
 
         /// The canonical path of the directory as bytes.
         pub fn real_path(&self) -> Vec<u8> {
-            super::path_to_bytes(&std::fs::canonicalize(&self.path).unwrap())
+            super::real_path_file(&super::path_to_bytes(&self.path)).unwrap()
         }
 
         /// The canonical path of a file in the directory as bytes.
         pub fn real_path_file(&self, sub_path: &str) -> Vec<u8> {
-            super::path_to_bytes(&std::fs::canonicalize(self.path.join(sub_path)).unwrap())
+            super::real_path_file(&super::path_to_bytes(&self.path.join(sub_path))).unwrap()
         }
 
         pub fn exists(&self, sub_path: &str) -> bool {
@@ -2109,6 +2150,37 @@ mod tests {
 
         // Temporary file should be gone
         assert!(!tmp_dir.exists(filename));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_load_windows_temporary_file_in_the_system_temp_dir() {
+        // Hosts pass GetTempPath output as is: a trailing backslash and,
+        // on many machines (GitHub's runners among them), an 8.3 short
+        // name such as `C:\Users\RUNNER~1\...`. Clients name their files
+        // under the same spelling.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "tty-graphics-protocol-ghostty-test-{}.data",
+            std::process::id()
+        ));
+        std::fs::write(&path, RGB_NONE_20X15).unwrap();
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _rm = Rm(path.clone());
+
+        let cmd = rgb_20x15(Medium::TemporaryFile, &path_to_bytes(&path));
+        let mut loading =
+            LoadingImage::init(&cmd, &Limits::all_with_temp_dir(&path_to_bytes(&dir))).unwrap();
+        let img = loading.complete().unwrap();
+        assert!(img.compression == Compression::None);
+
+        // Temporary file should be gone
+        assert!(std::fs::metadata(&path).is_err());
     }
 
     #[cfg(windows)]
