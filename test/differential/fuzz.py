@@ -12,14 +12,17 @@ differ or either runner crashes or hangs. Failures go to OUT/failures/, a few
 per signature (which snapshot field differed first, or how a runner died).
 
 --checked builds the Rust side with debug assertions (run.sh RUST_PROFILE=dev),
-so page integrity checks and overflow checks abort the Rust runner.
+so page integrity checks and overflow checks abort the Rust runner. Pair it
+with a Debug build of the Zig library (zig build -Demit-lib-vt=true
+-Doptimize=Debug --prefix DIR) so a crash on both sides shows up as
+crash-both: a bug the port shares with upstream, not a port difference.
 
 --replay runs one case and prints the first differing snapshot and the first
 differing lines of a value trace (compare.c's DIFF_TRACE). --minimize drops
 ops and write bytes while the case still fails the same way, then replays the
 result. --show prints a log as Python literals.
 """
-import concurrent.futures as cf, os, pathlib, random, shutil, subprocess, sys, tempfile, time
+import concurrent.futures as cf, os, pathlib, random, shutil, signal, subprocess, sys, tempfile, time
 
 here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(here))
@@ -139,7 +142,10 @@ def campaign(out, start, stop, seconds, jobs):
     def say(msg):
         print(msg, flush=True); log.write(msg + "\n"); log.flush()
     say("fuzz: seeds from %d, %s, %d jobs" % (start, "until %d" % stop if stop else "%ds" % seconds, jobs))
-    with cf.ProcessPoolExecutor(jobs) as pool:
+    def stop_now(*_): raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop_now)
+    pool = cf.ProcessPoolExecutor(jobs)
+    try:
         pending = set()
         def more():
             nonlocal nxt
@@ -164,6 +170,11 @@ def campaign(out, start, stop, seconds, jobs):
                 last = time.time()
                 say("%d seeds in %.0fs (%.1f/s), %d failing seeds, %d signatures" % (
                     total, last - t0, total / (last - t0), sum(map(len, seen.values())), len(seen)))
+        pool.shutdown()
+    except KeyboardInterrupt:
+        # Workers outlive a killed parent otherwise, runners included.
+        for p in list(getattr(pool, "_processes", {}).values()): p.kill()
+        say("interrupted")
     shutil.rmtree(work, ignore_errors=True)
     say("done: %d seeds (%d..%d) in %.0fs, %d failing seeds" % (total, start, nxt - 1, time.time() - t0, sum(map(len, seen.values()))))
     for sig, seeds in sorted(seen.items(), key=lambda kv: -len(kv[1])):
@@ -214,7 +225,10 @@ def replay(data, seed, chunk, out):
     return 1
 
 
-def ddmin(items, test):
+def ddmin(items, test, max_parts=None):
+    """Delta debugging: drop parts of items while test still passes. With
+    max_parts the parts never get smaller than len(items) / max_parts, which
+    keeps long writes from costing one run per byte."""
     n = 2
     while len(items) >= 2:
         size = -(-len(items) // n)
@@ -223,8 +237,8 @@ def ddmin(items, test):
             if test(rest):
                 items = rest; n = max(n - 1, 2); break
         else:
-            if n >= len(items): break
-            n = min(n * 2, len(items))
+            if n >= len(items) or (max_parts and n >= max_parts): break
+            n = min(n * 2, len(items), max_parts or len(items))
     return items
 
 
@@ -259,7 +273,7 @@ def minimize(data, seed, chunk, out):
             if tag == "W" and len(payload) > 1:
                 def with_payload(p, i=i):
                     return ops[:i] + [("W", [len(p)], bytes(p))] + ops[i + 1:]
-                p = ddmin(list(payload), lambda p: fails(with_payload(p)))
+                p = ddmin(list(payload), lambda p: fails(with_payload(p)), None if len(payload) <= 512 else 64)
                 ops = with_payload(p)
             if tag in "NR":
                 for small in ([1, 1], [2, 2], [5, 3], [10, 4], [20, 5], [args[0], 3], [3, args[1]], [80, 24]):
