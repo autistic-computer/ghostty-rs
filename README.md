@@ -6,8 +6,12 @@ terminal emulator from Zig to Rust (reference revision `93967b7`).
 Source imported from [ghrossty](https://github.com/vestergaardtechnology/ghrossty)
 at revision `22c6649679632701e7f6386c8825a1bc21a0a578`.
 
-This checkout includes bulk terminal-write optimizations and portable terminal
-tests. Its public C API headers are unchanged.
+This checkout includes bulk terminal-write optimizations, portable terminal
+tests, a `lib-vt` Cargo feature that builds only the terminal library, and
+zz's additions to the C API: `ghostty_terminal_clone_screen` (copy-on-write
+screen snapshots), `ghostty_render_state_row_cells_copy` with render state
+clips and trimmed row copies, spare-page reuse, and hyperlink row-copy reuse.
+`include/` matches zz's vendored Ghostty headers.
 
 ![The Rust port running as a GTK terminal](docs/screenshot-gtk.png)
 
@@ -59,7 +63,7 @@ fontconfig) and installs, Zig-style:
 The default prefix is `target/lib-vt/out`; `--debug` builds the dev profile
 and `GHOSTTY_LIB_VT_VERSION` overrides the version (Zig's
 `-Dlib-version-string`). Both libraries export only the libghostty-vt C API
-(205 functions, the same set as the Zig library): the crate is built as a
+(207 functions, the same set as zz's Zig library): the crate is built as a
 `staticlib` into `target/lib-vt` with the lib-vt terminal options (no tmux
 control mode, version 0.1.0-dev), partially linked with `--gc-sections`
 from those functions, and every other symbol is made local. The normal
