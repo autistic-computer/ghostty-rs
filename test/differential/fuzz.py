@@ -2,7 +2,7 @@
 
     fuzz.py ZIG_PREFIX [--time SECS] [--seeds A:B] [--jobs N] [--out DIR] [--checked]
     fuzz.py ZIG_PREFIX --replay SEED|CASE [--chunk N]
-    fuzz.py ZIG_PREFIX --minimize SEED|CASE [--chunk N]
+    fuzz.py ZIG_PREFIX --minimize SEED|CASE [--chunk N] [--timeout SECS]
     fuzz.py --show CASE
 
 The default mode builds both runners once (run.sh with BUILD_ONLY=1), then runs
@@ -22,7 +22,7 @@ differing lines of a value trace (compare.c's DIFF_TRACE). --minimize drops
 ops and write bytes while the case still fails the same way, then replays the
 result. --show prints a log as Python literals.
 """
-import concurrent.futures as cf, os, pathlib, random, shutil, signal, subprocess, sys, tempfile, time
+import concurrent.futures as cf, os, pathlib, random, re, shutil, signal, subprocess, sys, tempfile, time
 
 here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(here))
@@ -135,6 +135,11 @@ def save(out, sig, seed, detail, data, keep=3):
 
 def campaign(out, start, stop, seconds, jobs):
     work = tempfile.mkdtemp(prefix="fuzz-", dir=out)
+    # Run private copies: rebuilding a runner in place while the campaign
+    # uses it gets the running copy killed on macOS.
+    for side in ("zig", "rust"):
+        shutil.copy2(runners[side], os.path.join(work, side + "-runner"))
+        runners[side] = os.path.join(work, side + "-runner")
     seen, total, t0, last = {}, 0, time.time(), time.time()
     batch = 16
     nxt = start
@@ -242,6 +247,19 @@ def ddmin(items, test, max_parts=None):
     return items
 
 
+TOKEN = re.compile(
+    rb"\x1b\[[0-?]*[ -/]*[@-~]"                   # CSI
+    rb"|\x1b[\]P_X^][^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?"  # OSC, DCS, APC, SOS, PM
+    rb"|\x1b[ -/]*[0-~]"                          # other escapes
+    rb"|[\xc2-\xdf][\x80-\xbf]|[\xe0-\xef][\x80-\xbf]{2}|[\xf0-\xf4][\x80-\xbf]{3}"  # UTF-8
+    rb"|[\x00-\xff]", re.S)
+
+
+def tokens(payload):
+    """Split a write at escape sequence and character boundaries."""
+    return TOKEN.findall(payload)
+
+
 def minimize(data, seed, chunk, out):
     path = str(out / "minimize.bin")
     pathlib.Path(path).write_bytes(data)
@@ -272,8 +290,12 @@ def minimize(data, seed, chunk, out):
             tag, args, payload = ops[i]
             if tag == "W" and len(payload) > 1:
                 def with_payload(p, i=i):
-                    return ops[:i] + [("W", [len(p)], bytes(p))] + ops[i + 1:]
-                p = ddmin(list(payload), lambda p: fails(with_payload(p)), None if len(payload) <= 512 else 64)
+                    p = b"".join(p)
+                    return ops[:i] + [("W", [len(p)], p)] + ops[i + 1:]
+                # Whole sequences and characters first, then bytes.
+                p = ddmin(tokens(payload), lambda p: fails(with_payload(p)))
+                p = b"".join(p)
+                p = ddmin([p[j:j + 1] for j in range(len(p))], lambda p: fails(with_payload(p)), None if len(p) <= 512 else 64)
                 ops = with_payload(p)
             if tag in "NR":
                 for small in ([1, 1], [2, 2], [5, 3], [10, 4], [20, 5], [args[0], 3], [3, args[1]], [80, 24]):
@@ -299,7 +321,8 @@ def minimize(data, seed, chunk, out):
 
 def main(argv):
     opts = {"--time": None, "--seeds": None, "--jobs": str(max(1, (os.cpu_count() or 2) // 2)),
-            "--out": None, "--replay": None, "--minimize": None, "--chunk": None, "--show": None}
+            "--out": None, "--replay": None, "--minimize": None, "--chunk": None, "--show": None,
+            "--timeout": None}
     pos, it, checked = [], iter(argv), False
     for a in it:
         if a == "--checked": checked = True
@@ -313,9 +336,9 @@ def main(argv):
     out = pathlib.Path(opts["--out"] or here.parent.parent / "target" / ("fuzz-checked" if checked else "fuzz")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     runners.update(build(pos[0], out, checked))
-    if checked:
-        global TIMEOUT
-        TIMEOUT = 300
+    global TIMEOUT
+    if checked: TIMEOUT = 300
+    if opts["--timeout"]: TIMEOUT = float(opts["--timeout"])
     chunk = int(opts["--chunk"]) if opts["--chunk"] else None
     if opts["--replay"]:
         data, seed = load(opts["--replay"]); return replay(data, seed, chunk, out)

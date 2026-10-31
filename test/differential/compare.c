@@ -251,6 +251,13 @@ static void dump_extra(GhosttyTerminal t, GhosttyRenderState render) {
     uint8_t *buf = NULL; size_t n = 0; OK(ghostty_formatter_format_alloc(f, NULL, &buf, &n));
     blob(buf, n); ghostty_free(NULL, buf, n); ghostty_formatter_free(f);
   }
+  if (trace) {
+    /* Page structure, for triage only: pool reuse may differ by design. */
+    GhosttyTerminalMemoryUsage m = GHOSTTY_INIT_SIZED(GhosttyTerminalMemoryUsage);
+    if (ghostty_terminal_get(t, GHOSTTY_TERMINAL_DATA_MEMORY_USAGE, &m) == GHOSTTY_SUCCESS)
+      mark("memory pages %" PRIu64 " virtual %" PRIu64 " compressed %" PRIu64 " alt pages %" PRIu64,
+           m.primary_pages, m.primary_virtual_bytes, m.primary_compressed_pages, m.alternate_pages);
+  }
   printf(" events %016" PRIx64 " extra %016" PRIx64, events, h);
 }
 static void color(GhosttyStyleColor c) {
