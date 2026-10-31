@@ -1240,6 +1240,12 @@ impl Page {
             // the destination id it mapped to, so runs of the same link in
             // a row bump the refcount without hashing the URI again.
             let mut last_hyperlink: Option<(hyperlink::Id, hyperlink::Id)> = None;
+            // Cross-page copies likewise remember the last source style id
+            // and its destination id. Zig calls addWithId for every styled
+            // cell; once a style is in this page that call only finds it
+            // again and bumps its refcount, which is all `use_` does, so
+            // runs of one style skip the hash and lookup.
+            let mut last_style: Option<(style::Id, style::Id)> = None;
             for i in 0..len {
                 // SAFETY: within the rows; src and dst are different cells.
                 let (src_cell, dst_cell) = unsafe { (&*other_cells.add(i), &mut *cells.add(i)) };
@@ -1356,6 +1362,11 @@ impl Page {
                         dst_cell.set_style_id(src_cell.style_id());
                         // SAFETY: `self.memory` is the page base.
                         unsafe { self.styles.use_(self.memory, dst_cell.style_id()) };
+                    } else if let Some((_, last_dst)) = last_style.filter(|&(src, _)| src == src_cell.style_id()) {
+                        // SAFETY: `self.memory` is the page base and
+                        // `last_dst` is alive: this loop only adds references.
+                        unsafe { self.styles.use_(self.memory, last_dst) };
+                        dst_cell.set_style_id(last_dst);
                     } else {
                         // Slow path: Get the style from the other
                         // page and add it to this page's style set.
@@ -1363,13 +1374,15 @@ impl Page {
                         let other_style: Style = unsafe { *other.styles.get(other.memory, src_cell.style_id()) };
                         // SAFETY: `self.memory` is the page base.
                         let added = unsafe { self.styles.add_with_id(self.memory, other_style, src_cell.style_id()) };
-                        dst_cell.set_style_id(match added {
+                        let dst_id = match added {
                             Ok(v) => v.unwrap_or(src_cell.style_id()),
                             // The style set capacity needs to be increased.
                             Err(AddError::OutOfMemory) => return Err(CloneFromError::StyleSetOutOfMemory),
                             // The style set needs to be rehashed.
                             Err(AddError::NeedsRehash) => return Err(CloneFromError::StyleSetNeedsRehash),
-                        });
+                        };
+                        dst_cell.set_style_id(dst_id);
+                        last_style = Some((src_cell.style_id(), dst_id));
                     }
                 }
                 if build_options::KITTY_GRAPHICS && src_cell.codepoint() == graphics_unicode::PLACEHOLDER {
@@ -4371,6 +4384,66 @@ mod tests {
         let dst_row = row(dst, 0);
         let src_row = row(src, 0);
         unsafe { dst.clone_row_from(src, dst_row, src_row) }
+    }
+
+    /// Runs of one style across pages reuse the last mapping (see
+    /// `last_style`), so ids and reference counts must come out as if every
+    /// cell had gone through addWithId.
+    #[test]
+    fn page_clone_row_from_style_runs_remap_ids_and_release_references() {
+        let mut src = init(cap3(10, 1, 8));
+        let mut dst = init(src.capacity);
+        let mut italic = Style::default();
+        italic.flags.italic = true;
+        let mut underline = Style::default();
+        underline.flags.underline = crate::terminal::sgr::Underline::Single;
+
+        let (src_mem, dst_mem) = (src.memory, dst.memory);
+        let a = unsafe { src.styles.add(src_mem, bold()) }.unwrap();
+        let b = unsafe { src.styles.add(src_mem, italic) }.unwrap();
+        // The destination already holds bold under a different id, so runs
+        // of `a` map to `existing` instead of keeping their id.
+        let unrelated = unsafe { dst.styles.add(dst_mem, underline) }.unwrap();
+        let existing = unsafe { dst.styles.add(dst_mem, bold()) }.unwrap();
+        assert!(a != existing);
+        let refs = |page: &Page, id| unsafe { page.styles.ref_count(page.memory, id) };
+
+        let ids = [Some(a), Some(a), None, Some(a), Some(b), Some(b), Some(a), None, Some(b), Some(b)];
+        for (x, maybe_id) in ids.iter().enumerate() {
+            let (row, cell) = rac(&src, x, 0);
+            *cell = cp_cell('a' as u32 + x as u32);
+            if let Some(id) = *maybe_id {
+                unsafe { src.styles.use_(src.memory, id) };
+                cell.set_style_id(id);
+                row.set_styled(true);
+            }
+        }
+
+        for _ in 0..2 {
+            clone_row_0(&mut dst, &src).unwrap();
+            assert_eq!(5, refs(&dst, existing));
+            assert_eq!(1, refs(&dst, unrelated));
+            for (x, maybe_id) in ids.iter().enumerate() {
+                let cell = rac(&dst, x, 0).1;
+                assert_eq!('a' as u32 + x as u32, cell.content_codepoint());
+                match *maybe_id {
+                    Some(id) if id == a => assert_eq!(existing, cell.style_id()),
+                    Some(_) => {
+                        let style = unsafe { *dst.styles.get(dst.memory, cell.style_id()) };
+                        assert!(italic.eql(&style));
+                        assert_eq!(4, refs(&dst, cell.style_id()));
+                    }
+                    None => assert_eq!(style::DEFAULT_ID, cell.style_id()),
+                }
+            }
+        }
+        let cols = dst.size.cols as usize;
+        let dst_row = row(&dst, 0);
+        dst.clear_cells(dst_row, 0, cols);
+        assert_eq!(1, refs(&dst, existing));
+        assert_eq!(1, refs(&dst, unrelated));
+        assert_eq!(5, refs(&src, a));
+        assert_eq!(5, refs(&src, b));
     }
 
     #[test]
