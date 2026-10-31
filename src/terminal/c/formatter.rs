@@ -341,32 +341,162 @@ pub unsafe extern "C" fn format_alloc(
     let Some(wrapper) = formatter_.as_ref() else {
         return Result::InvalidValue;
     };
+    let alloc = lib_alloc::default(alloc_);
 
-    let mut buf: Vec<u8> = Vec::new();
+    let mut aw = AllocatingWriter::init(alloc);
     match &wrapper.kind {
         Kind::Terminal(t) => {
-            if t.format(&mut buf).is_err() {
+            if t.format(&mut aw).is_err() {
                 return Result::OutOfMemory;
             }
         }
     }
 
+    let Some((ptr, len)) = aw.to_owned_slice() else {
+        return Result::OutOfMemory;
+    };
     // Empty Zig slices may contain sentinel pointers that foreign runtimes
     // reject even when the length is zero (for example Go's stack scanner).
-    if buf.is_empty() {
-        *out_ptr = std::ptr::null_mut();
-        *out_len = 0;
-        return Result::Success;
-    }
-    let alloc = lib_alloc::default(alloc_);
-    let ptr = alloc.alloc(buf.len(), 0, 0);
-    if ptr.is_null() {
-        return Result::OutOfMemory;
-    }
-    std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, buf.len());
     *out_ptr = ptr;
-    *out_len = buf.len();
+    *out_len = len;
     Result::Success
+}
+
+/// Zig's `std.Io.Writer.Allocating`: the output grows in memory from the
+/// caller's allocator and is handed over without a copy. (The port used
+/// to format into a `Vec` and copy it into the caller's allocator, a
+/// whole extra pass over output that runs to megabytes with history.)
+struct AllocatingWriter<'a> {
+    alloc: lib_alloc::DefaultAllocator<'a>,
+    ptr: *mut u8,
+    len: usize,
+    capacity: usize,
+}
+
+impl<'a> AllocatingWriter<'a> {
+    /// Zig: `ArrayList(u8).growCapacity`'s `init_capacity`, a cache line.
+    const INIT_CAPACITY: usize = 64;
+
+    fn init(alloc: lib_alloc::DefaultAllocator<'a>) -> AllocatingWriter<'a> {
+        AllocatingWriter {
+            alloc,
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    /// Grow to hold at least `additional` more bytes (Zig: `drain` and
+    /// `ensureUnusedCapacity`: half again plus `init_capacity` over what
+    /// is needed, remapping before moving).
+    #[cold]
+    fn grow(&mut self, additional: usize) -> std::io::Result<()> {
+        let oom = || std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        let minimum = self
+            .len
+            .checked_add(additional)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(oom)?;
+        let new_capacity = minimum.saturating_add(minimum / 2 + Self::INIT_CAPACITY);
+
+        if !self.ptr.is_null() {
+            let ptr = self.remap(new_capacity);
+            if !ptr.is_null() {
+                self.ptr = ptr;
+                self.capacity = new_capacity;
+                return Ok(());
+            }
+        }
+
+        let ptr = self.alloc.alloc(new_capacity, 0, 0);
+        if ptr.is_null() {
+            return Err(oom());
+        }
+        if !self.ptr.is_null() {
+            // SAFETY: both buffers hold at least `len` bytes and are
+            // distinct allocations.
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr, ptr, self.len) };
+            self.alloc.free(self.ptr, self.capacity, 0, 0);
+        }
+        self.ptr = ptr;
+        self.capacity = new_capacity;
+        Ok(())
+    }
+
+    /// `rawRemap` of the buffer to `new_len` bytes: null if it can't.
+    /// Zig 0.17's `c_allocator` remaps with `realloc` when an in-place
+    /// resize fails, which `lib::allocator`'s libc remap doesn't do, so
+    /// the libc default reallocs here (a byte buffer only needs malloc's
+    /// alignment).
+    fn remap(&self, new_len: usize) -> *mut u8 {
+        match self.alloc {
+            lib_alloc::DefaultAllocator::Libc => {
+                if new_len <= self.capacity {
+                    return self.ptr;
+                }
+                // SAFETY: ptr came from malloc/realloc.
+                unsafe { libc::realloc(self.ptr.cast(), new_len).cast() }
+            }
+            lib_alloc::DefaultAllocator::C(_) => self.alloc.remap(self.ptr, self.capacity, 0, new_len, 0),
+        }
+    }
+
+    /// Hand the written bytes to the caller, who frees them with the same
+    /// allocator and length (Zig: `toOwnedSlice`). An empty output is
+    /// null. None if moving to an exact-size allocation failed.
+    fn to_owned_slice(mut self) -> Option<(*mut u8, usize)> {
+        // Drop frees whatever is left.
+        if self.len == 0 {
+            return Some((std::ptr::null_mut(), 0));
+        }
+
+        // Shrink to the exact length, which the caller frees.
+        let shrunk = self.remap(self.len);
+        if !shrunk.is_null() {
+            self.ptr = std::ptr::null_mut();
+            return Some((shrunk, self.len));
+        }
+        let exact = self.alloc.alloc(self.len, 0, 0);
+        if exact.is_null() {
+            return None;
+        }
+        // SAFETY: both buffers hold at least `len` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr, exact, self.len) };
+        Some((exact, self.len))
+    }
+}
+
+impl std::io::Write for AllocatingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.capacity - self.len < buf.len() {
+            self.grow(buf.len())?;
+        }
+        // SAFETY: the buffer has room for `buf` after `len`.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), self.ptr.add(self.len), buf.len()) };
+        self.len += buf.len();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for AllocatingWriter<'_> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            self.alloc.free(self.ptr, self.capacity, 0, 0);
+        }
+    }
 }
 
 /// C: ghostty_formatter_free
@@ -468,6 +598,45 @@ mod tests {
             assert_eq!(Result::Success, format_alloc(f, None, &mut ptr, &mut len));
             assert_eq!(b"hello", std::slice::from_raw_parts(ptr, len));
             allocator_c::free(None, ptr, len);
+
+            free(f);
+            terminal_c::free(t);
+        }
+    }
+
+    #[test]
+    fn format_alloc_grows_output() {
+        // Enough output to grow the buffer many times: through realloc
+        // with the default allocator and through alloc and copy with a C
+        // allocator whose remap only resizes in place.
+        let t = new_terminal(80, 24);
+        for i in 0..200 {
+            write(t, format!("\x1b[3{}mline {i} \x1b[1mbold\x1b[0m tail\r\n", i % 8).as_bytes());
+        }
+        let mut extra = extra_none();
+        extra.palette = true;
+        extra.screen.style = true;
+        let f = new_formatter(t, TerminalOptions::new(Format::Vt, false, false, extra));
+        unsafe {
+            let mut required: usize = 0;
+            assert_eq!(Result::OutOfSpace, format_buf(f, std::ptr::null_mut(), 0, &mut required));
+            let mut expected = vec![0u8; required];
+            let mut written: usize = 0;
+            assert_eq!(Result::Success, format_buf(f, expected.as_mut_ptr(), required, &mut written));
+            assert!(written > 4096);
+
+            for allocator in [None, Some(&C_ALLOCATOR)] {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut len: usize = 0;
+                assert_eq!(Result::Success, format_alloc(f, allocator, &mut ptr, &mut len));
+                assert_eq!(expected, std::slice::from_raw_parts(ptr, len));
+                allocator_c::free(allocator, ptr, len);
+            }
+
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut len: usize = 0;
+            let failing: &CAllocator = &FAILING_C_ALLOCATOR;
+            assert_eq!(Result::OutOfMemory, format_alloc(f, Some(failing), &mut ptr, &mut len));
 
             free(f);
             terminal_c::free(t);
