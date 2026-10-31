@@ -4,9 +4,10 @@
 //!
 //! Deviation: the Zig SIMD build calls simdutf (`base64.cpp`) for `maxLen`
 //! and `decode`. This port always uses the Zig scalar path
-//! (`base64_scalar.rs`), so unlike simdutf, ASCII whitespace inside the input
-//! is rejected by [`decode`] instead of being skipped. [`decode_strict`] and
-//! [`Streaming`] behave identically either way.
+//! (`base64_scalar.rs`), and [`decode`] checks simdutf's rules for
+//! whitespace, padding and the final group before handing the input to it,
+//! so it accepts and rejects the same inputs as the SIMD build.
+//! [`decode_strict`] and [`Streaming`] behave identically either way.
 
 use std::fmt;
 
@@ -57,16 +58,54 @@ fn max_len_scalar(input: &[u8]) -> usize {
 }
 
 pub fn decode<'a>(input: &[u8], output: &'a mut [u8]) -> Result<&'a [u8], DecodeError> {
-    // The SIMD build uses simdutf's `base64_to_binary` (default options),
-    // which skips ASCII whitespace and accepts a partial final chunk.
-    // Emulate that on top of the scalar decoder.
+    // The SIMD build uses simdutf's `base64_to_binary` (default options,
+    // loose last chunk). Emulate it on top of the scalar decoder:
+    // - ASCII whitespace is skipped anywhere.
+    // - At most two '=' end the input, with whitespace allowed around
+    //   them (simdutf's find_end). Any other '=' is an invalid character.
+    // - A final group of one character is an error, and padding, when
+    //   present, must complete the final group of two or three characters.
     const fn is_ws(c: u8) -> bool {
         matches!(c, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r')
     }
-    if !input.iter().any(|&c| is_ws(c)) {
-        return decode_scalar(input, output);
+    let mut end = input.len();
+    while end > 0 && is_ws(input[end - 1]) {
+        end -= 1;
     }
-    let filtered: Vec<u8> = input.iter().copied().filter(|&c| !is_ws(c)).collect();
+    let mut padding = 0;
+    if end > 0 && input[end - 1] == b'=' {
+        end -= 1;
+        padding = 1;
+        while end > 0 && is_ws(input[end - 1]) {
+            end -= 1;
+        }
+        if end > 0 && input[end - 1] == b'=' {
+            end -= 1;
+            padding = 2;
+        }
+    }
+    let body = &input[..end];
+    let mut chars = 0;
+    for &c in body {
+        if is_ws(c) {
+            continue;
+        }
+        if !base64_scalar::is_alphabet_char(c) {
+            return Err(DecodeError::Base64Invalid);
+        }
+        chars += 1;
+    }
+    match (chars % 4, padding) {
+        (_, 0) if chars == 0 => return Ok(&output[..0]),
+        (1, _) => return Err(DecodeError::Base64Invalid),
+        (0, 1..) => return Err(DecodeError::Base64Invalid),
+        (rem, 1..) if (rem + padding) % 4 != 0 => return Err(DecodeError::Base64Invalid),
+        _ => {}
+    }
+    if chars == body.len() {
+        return decode_scalar(body, output);
+    }
+    let filtered: Vec<u8> = body.iter().copied().filter(|&c| !is_ws(c)).collect();
     let len = decode_scalar(&filtered, output)?.len();
     Ok(&output[..len])
 }
@@ -298,6 +337,37 @@ mod tests {
         assert_eq!(decode(input, &mut out).unwrap(), b"hello world");
         assert_eq!(max_len(b"aGVsbG8="), 5);
         assert_eq!(max_len(b"aGVsbG8"), 5);
+    }
+
+    #[test]
+    fn decode_padding_and_final_group_like_simdutf() {
+        // Found by test/differential/fuzz.py: a Kitty graphics payload of
+        // "A" was accepted as empty, where simdutf rejects it and the
+        // command is dropped. Expected results are simdutf's base64_to_binary.
+        let ok: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b" \n", b""),
+            (b"AA", b"\x00"),
+            (b"AB", b"\x00"),
+            (b"AAA", b"\x00\x00"),
+            (b"AA==", b"\x00"),
+            (b"AAA=", b"\x00\x00"),
+            (b"AA = = ", b"\x00"),
+            (b"AA AA", b"\x00\x00\x00"),
+            (b"aGVsbG8=\n", b"hello"),
+        ];
+        for (input, want) in ok {
+            let mut out = vec![0u8; max_len(input) + 3];
+            assert_eq!(decode(input, &mut out), Ok(*want), "{:?}", String::from_utf8_lossy(input));
+        }
+        let bad: &[&[u8]] = &[
+            b"A", b"AAAAA", b"=", b"==", b"A=", b"AA=", b"A===", b"AA===", b"AAA==", b"AAAA=", b"AAAA==",
+            b"AAA=A", b"AA=A", b"A=B==", b"\x0bAAAA", b"AA\xffA",
+        ];
+        for input in bad {
+            let mut out = vec![0u8; max_len(input) + 3];
+            assert!(decode(input, &mut out).is_err(), "{:?}", String::from_utf8_lossy(input));
+        }
     }
 
     #[test]

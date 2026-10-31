@@ -146,13 +146,19 @@ impl PageEntry {
             PageEntryId::Implicit(_) => 1,
         };
         hasher.update(&[tag]);
+        // autoHashStrat(.Deep) on a slice hashes its bytes and then its
+        // length as a usize.
         match self.id {
             PageEntryId::Implicit(v) => hasher.update(&v.to_ne_bytes()),
-            // SAFETY: `base` is the base of the memory holding the strings.
-            PageEntryId::Explicit(slice) => hasher.update(unsafe { slice.slice(base) }),
+            PageEntryId::Explicit(slice) => {
+                // SAFETY: `base` is the base of the memory holding the strings.
+                hasher.update(unsafe { slice.slice(base) });
+                hasher.update(&slice.len.to_ne_bytes());
+            }
         }
         // SAFETY: as above.
         hasher.update(unsafe { self.uri.slice(base) });
+        hasher.update(&self.uri.len.to_ne_bytes());
         hasher.final_()
     }
 
@@ -272,3 +278,27 @@ pub type Set = RefCountedSet<PageEntry, Id, size::CellCountInt, SetContext>;
 
 /// The item type of [`Set`] (Zig: `Set.Item`).
 pub type SetItem = ref_counted_set::Item<PageEntry, Id, size::CellCountInt>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::size::Offset;
+
+    /// Expected values come from Zig's `PageEntry.hash` (Wyhash with
+    /// `autoHash`), so a set fills, probes and grows the same way in both.
+    /// Found by test/differential/fuzz.py: without the slice lengths, pages
+    /// holding many hyperlinks grew at different times, which changed page
+    /// sizes, page boundaries and how much scrollback a byte limit pruned.
+    #[test]
+    fn page_entry_hash_matches_zig() {
+        let mut buf = *b"foohttp://example.comhttps://x.example";
+        let base = buf.as_mut_ptr();
+        let entry = |id, uri: (u32, usize)| PageEntry { id, uri: OffsetSlice::new(Offset::new(uri.0), uri.1) };
+        let explicit = entry(PageEntryId::Explicit(OffsetSlice::new(Offset::new(0), 3)), (3, 18));
+        assert_eq!(explicit.hash(base), 0x5df5bee1d46a496e);
+        let empty = entry(PageEntryId::Explicit(OffsetSlice::new(Offset::new(0), 0)), (0, 0));
+        assert_eq!(empty.hash(base), 0xec264b8ab043dc8e);
+        let implicit = entry(PageEntryId::Implicit(7), (21, 17));
+        assert_eq!(implicit.hash(base), 0xadcc1eaae8682862);
+    }
+}
