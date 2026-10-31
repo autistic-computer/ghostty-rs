@@ -24,6 +24,13 @@
 //!   the caller's cell, style and grapheme buffers with `ptr::write`.
 //! - `trimmedEnd` ORs each group of eight raw cells with a fold over a
 //!   `[Cell; 8]` instead of `@Vector`/`@reduce`.
+//! - `row_cells_copy` builds each copied cell from the raw cell bits
+//!   (one 8-byte and one 4-byte store) instead of reading every field
+//!   through its enum, gives unstyled codepoint cells and styled cells
+//!   continuing the previous style ID their own short paths, and only
+//!   compares styles when the style ID changes. The output is the same,
+//!   style and grapheme indexes included. See `copy_run`.
+//! - `row_get` answers `dirty` before the general dispatch.
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
@@ -43,7 +50,7 @@ use crate::terminal::page::{self, ContentTag};
 use crate::terminal::page_list::Pin;
 use crate::terminal::render as renderpkg;
 use crate::terminal::size::CellCountInt;
-use crate::terminal::style::Color as StyleColor;
+use crate::terminal::style::{self, Color as StyleColor};
 
 const LOG_TARGET: &str = "render_state_c";
 
@@ -1152,6 +1159,179 @@ impl RowCellsCopy {
 const COPY_STYLE_SLOTS: usize = 256;
 const COPY_STYLE_SLOT_EMPTY: u32 = u32::MAX;
 
+/// Reads a field of a raw cell straight from its bits.
+#[inline(always)]
+fn cell_field(bits: u64, f: page::BitField) -> u64 {
+    (bits & f.mask()) >> f.offset
+}
+
+/// Bytes 8..12 of a copied cell after the content tag (`wide`, `flags`
+/// and `semantic_content`, as a little-endian `u32`), by the six cell
+/// bits from `wide` to `semantic_content`.
+const COPY_HIGH: [u32; 64] = {
+    let mut t = [0u32; 64];
+    let mut v = 0;
+    while v < 64 {
+        let wide = v & 0b11;
+        let protected = (v >> 2) & 1;
+        let hyperlink = (v >> 3) & 1;
+        let semantic = (v >> 4) & 0b11;
+        let flags = hyperlink * CopiedCell::HYPERLINK as usize + protected * CopiedCell::PROTECTED as usize;
+        t[v] = ((wide << 8) | (flags << 16) | (semantic << 24)) as u32;
+        v += 1;
+    }
+    t
+};
+
+// `write_copied` stores a copied cell as one `u64` and one `u32`.
+const _: () = {
+    assert!(offset_of!(CopiedCell, content) == 0);
+    assert!(offset_of!(CopiedCell, style) == 4);
+    assert!(offset_of!(CopiedCell, grapheme) == 6);
+    assert!(offset_of!(CopiedCell, content_tag) == 8);
+    assert!(offset_of!(CopiedCell, wide) == 9);
+    assert!(offset_of!(CopiedCell, flags) == 10);
+    assert!(offset_of!(CopiedCell, semantic_content) == 11);
+    assert!(size_of::<CopiedCell>() == 12);
+    {
+        use page::cell_fields as f;
+        assert!(f::WIDE.offset == 42 && f::WIDE.bits == 2);
+        assert!(f::PROTECTED.offset == 44 && f::HYPERLINK.offset == 45);
+        assert!(f::SEMANTIC_CONTENT.offset == 46 && f::SEMANTIC_CONTENT.bits == 2);
+    }
+};
+
+/// The copied form of a raw cell as its first eight bytes (`content`,
+/// `style`, `grapheme`) and last four (`content_tag`, `wide`, `flags`,
+/// `semantic_content`), built from the cell bits with shifts, masks and
+/// a table. Zig reads each field through its enum and stores it on its
+/// own; here that costs a jump table per cell (`semantic_content` has a
+/// panicking arm for its unused value) and eight stores.
+#[inline(always)]
+fn copied_cell(bits: u64, style: u16, grapheme: u16) -> (u64, u32) {
+    use page::cell_fields as f;
+    let tag = cell_field(bits, f::CONTENT_TAG) as u32;
+    let raw = cell_field(bits, f::CONTENT) as u32;
+    let content = if tag & 0b10 == 0 {
+        // codepoint, codepoint_grapheme
+        raw & 0x1F_FFFF
+    } else if tag == ContentTag::BgColorPalette as u32 {
+        raw & 0xFF
+    } else {
+        // The cell holds r, g, b from the low byte up; the copy holds
+        // 0xRRGGBB.
+        ((raw & 0xFF) << 16) | (raw & 0xFF00) | (raw >> 16)
+    };
+    let low = content as u64 | (style as u64) << 32 | (grapheme as u64) << 48;
+    let high = tag | COPY_HIGH[(bits >> f::WIDE.offset) as usize & 0x3F];
+    (low, high)
+}
+
+/// Writes a copied cell given as `copied_cell` returns it.
+///
+/// # Safety
+/// `out` must be valid for a `CopiedCell` write.
+#[inline(always)]
+unsafe fn write_copied(out: *mut CopiedCell, (low, high): (u64, u32)) {
+    if cfg!(target_endian = "little") {
+        let p = out as *mut u8;
+        (p as *mut u64).write_unaligned(low);
+        (p.add(8) as *mut u32).write_unaligned(high);
+    } else {
+        out.write(CopiedCell {
+            content: low as u32,
+            style: (low >> 32) as u16,
+            grapheme: (low >> 48) as u16,
+            content_tag: high as u8,
+            wide: (high >> 8) as u8,
+            flags: (high >> 16) as u8,
+            semantic_content: (high >> 24) as u8,
+        });
+    }
+}
+
+/// The style table that `row_cells_copy` fills.
+struct CopyStyles {
+    out: *mut style_c::Style,
+    cap: usize,
+    len: usize,
+    /// The direct-mapped style cache, filled on first use so rows
+    /// without styles don't pay for it.
+    slots: std::mem::MaybeUninit<[u32; COPY_STYLE_SLOTS]>,
+    slots_ready: bool,
+}
+
+impl CopyStyles {
+    /// The style table index of the styled cell at `cx`: the previous
+    /// styled cell's index if they have the same style, else the
+    /// cached index for an equal style, else a new entry.
+    #[inline(never)]
+    fn index(&mut self, styles: &[style::Style], cx: usize, previous_x: usize, previous_style: u16) -> u16 {
+        let s = &styles[cx];
+        if previous_x != POSITION_NONE && styles[previous_x].eql(s) {
+            return previous_style;
+        }
+        if !self.slots_ready {
+            self.slots.write([COPY_STYLE_SLOT_EMPTY; COPY_STYLE_SLOTS]);
+            self.slots_ready = true;
+        }
+        // SAFETY: initialized just above.
+        let slots = unsafe { self.slots.assume_init_mut() };
+        let slot = &mut slots[(s.hash() as usize) % COPY_STYLE_SLOTS];
+        if *slot != COPY_STYLE_SLOT_EMPTY && styles[(*slot >> 16) as usize].eql(s) {
+            return *slot as u16;
+        }
+        let index = self.len as u16;
+        if self.len < self.cap && !self.out.is_null() {
+            // SAFETY: the caller's style buffer holds `cap` entries.
+            unsafe { self.out.add(self.len).write(style_c::Style::from_style(s)) };
+        }
+        self.len += 1;
+        *slot = ((cx as u32) << 16) | index as u32;
+        index
+    }
+}
+
+/// The grapheme table and bytes that `row_cells_copy` fills.
+struct CopyGraphemes {
+    out: *mut CopiedGrapheme,
+    cap: usize,
+    len: usize,
+    bytes: *mut u8,
+    bytes_cap: usize,
+    bytes_len: usize,
+}
+
+impl CopyGraphemes {
+    /// Appends the grapheme of `cell` and returns its 1-based index.
+    #[inline(never)]
+    fn push(&mut self, cell: page::Cell, extra: &[u32]) -> std::result::Result<u16, Result> {
+        let fits = self.bytes_len < self.bytes_cap && !self.bytes.is_null();
+        let mut buffer = Buffer {
+            // SAFETY: the caller's byte buffer holds `bytes_cap` bytes.
+            ptr: if fits { unsafe { self.bytes.add(self.bytes_len) } } else { std::ptr::null_mut() },
+            cap: if fits { self.bytes_cap - self.bytes_len } else { 0 },
+            len: 0,
+        };
+        match row_cells_get_graphemes_utf8(cell, extra, &mut buffer) {
+            Result::Success | Result::OutOfSpace => {}
+            result => return Err(result),
+        }
+        if self.len < self.cap && self.bytes_len + buffer.len <= self.bytes_cap && !self.out.is_null() {
+            // SAFETY: the caller's grapheme buffer holds `cap` entries.
+            unsafe {
+                self.out.add(self.len).write(CopiedGrapheme {
+                    offset: self.bytes_len as u32,
+                    len: buffer.len as u32,
+                })
+            };
+        }
+        self.len += 1;
+        self.bytes_len += buffer.len;
+        Ok(self.len as u16)
+    }
+}
+
 /// C: ghostty_render_state_row_cells_copy
 ///
 /// # Safety
@@ -1191,12 +1371,6 @@ pub unsafe extern "C" fn row_cells_copy(
     };
     let out_cells = addr_of!((*out_).cells).read();
     let cells_cap = addr_of!((*out_).cells_cap).read();
-    let out_styles = addr_of!((*out_).styles).read();
-    let styles_cap = addr_of!((*out_).styles_cap).read();
-    let out_graphemes = addr_of!((*out_).graphemes).read();
-    let graphemes_cap = addr_of!((*out_).graphemes_cap).read();
-    let out_bytes = addr_of!((*out_).grapheme_bytes).read();
-    let bytes_cap = addr_of!((*out_).grapheme_bytes_cap).read();
 
     let start: usize = x as usize;
     let end: usize = if flags & RowCellsCopy::TRIM != 0 {
@@ -1205,104 +1379,182 @@ pub unsafe extern "C" fn row_cells_copy(
         (start + len as usize).min(raws.len())
     };
 
-    let mut styles_len: usize = 1;
-    if styles_cap >= 1 && !out_styles.is_null() {
-        out_styles.write(style_c::Style::DEFAULT);
+    let mut styles = CopyStyles {
+        out: addr_of!((*out_).styles).read(),
+        cap: addr_of!((*out_).styles_cap).read(),
+        len: 1,
+        slots: std::mem::MaybeUninit::uninit(),
+        slots_ready: false,
+    };
+    if styles.cap >= 1 && !styles.out.is_null() {
+        styles.out.write(style_c::Style::DEFAULT);
     }
-    let mut graphemes_len: usize = 0;
-    let mut bytes_len: usize = 0;
-    let mut slots = [COPY_STYLE_SLOT_EMPTY; COPY_STYLE_SLOTS];
-    let mut previous_x: usize = POSITION_NONE;
-    let mut previous_style: u16 = 0;
+    let mut graphemes = CopyGraphemes {
+        out: addr_of!((*out_).graphemes).read(),
+        cap: addr_of!((*out_).graphemes_cap).read(),
+        len: 0,
+        bytes: addr_of!((*out_).grapheme_bytes).read(),
+        bytes_cap: addr_of!((*out_).grapheme_bytes_cap).read(),
+        bytes_len: 0,
+    };
 
-    for (i, cx) in (start..end).enumerate() {
+    if end > start {
         // A non-empty range means the wrapper was populated.
         let row: &renderpkg::Cells = cells.cells();
-        let cell = raws[cx];
-
-        let mut style_index: u16 = 0;
-        if cell.has_styling() {
-            let s = &row.style[cx];
-            if previous_x != POSITION_NONE && row.style[previous_x].eql(s) {
-                style_index = previous_style;
-            } else {
-                let slot = &mut slots[(s.hash() as usize) % COPY_STYLE_SLOTS];
-                if *slot != COPY_STYLE_SLOT_EMPTY && row.style[(*slot >> 16) as usize].eql(s) {
-                    style_index = *slot as u16;
-                } else {
-                    style_index = styles_len as u16;
-                    if styles_len < styles_cap && !out_styles.is_null() {
-                        out_styles.add(styles_len).write(style_c::Style::from_style(s));
-                    }
-                    styles_len += 1;
-                    *slot = ((cx as u32) << 16) | style_index as u32;
-                }
-            }
-            previous_x = cx;
-            previous_style = style_index;
+        let cells_len = end - start;
+        // The cells that fit the caller's buffer are written; the rest
+        // are only counted (with their styles and graphemes) so the
+        // caller learns the sizes it needs.
+        let written = if out_cells.is_null() { 0 } else { cells_cap.min(cells_len) };
+        let mut state = CopyRun {
+            previous_x: POSITION_NONE,
+            previous_style: 0,
+            previous_key: COPY_NO_KEY,
+        };
+        if let Err(result) =
+            copy_run::<true>(row, start, start + written, out_cells, &mut styles, &mut graphemes, &mut state)
+        {
+            return result;
         }
-
-        let mut grapheme: u16 = 0;
-        if cell.has_grapheme() && cell.has_text() {
-            let fits = bytes_len < bytes_cap && !out_bytes.is_null();
-            let mut buffer = Buffer {
-                ptr: if fits { out_bytes.add(bytes_len) } else { std::ptr::null_mut() },
-                cap: if fits { bytes_cap - bytes_len } else { 0 },
-                len: 0,
-            };
-            match row_cells_get_graphemes_utf8(cell, row.grapheme(cx), &mut buffer) {
-                Result::Success | Result::OutOfSpace => {}
-                result => return result,
-            }
-            if graphemes_len < graphemes_cap && bytes_len + buffer.len <= bytes_cap && !out_graphemes.is_null() {
-                out_graphemes.add(graphemes_len).write(CopiedGrapheme {
-                    offset: bytes_len as u32,
-                    len: buffer.len as u32,
-                });
-            }
-            graphemes_len += 1;
-            bytes_len += buffer.len;
-            grapheme = graphemes_len as u16;
-        }
-
-        if i < cells_cap && !out_cells.is_null() {
-            out_cells.add(i).write(CopiedCell {
-                content: match cell.content_tag() {
-                    ContentTag::Codepoint | ContentTag::CodepointGrapheme => cell.content_codepoint(),
-                    ContentTag::BgColorPalette => cell.content_color_palette() as u32,
-                    ContentTag::BgColorRgb => {
-                        let rgb = cell.content_color_rgb();
-                        ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | rgb.b as u32
-                    }
-                },
-                style: style_index,
-                grapheme,
-                content_tag: cell.content_tag() as u8,
-                wide: cell.wide() as u8,
-                flags: (if cell.hyperlink() { CopiedCell::HYPERLINK } else { 0 })
-                    | (if cell.protected() { CopiedCell::PROTECTED } else { 0 }),
-                semantic_content: cell.semantic_content() as u8,
-            });
+        if let Err(result) = copy_run::<false>(
+            row,
+            start + written,
+            end,
+            std::ptr::null_mut(),
+            &mut styles,
+            &mut graphemes,
+            &mut state,
+        ) {
+            return result;
         }
     }
 
     let cells_len = end - start;
+    let styles_len = styles.len;
+    let graphemes_len = graphemes.len;
+    let bytes_len = graphemes.bytes_len;
     addr_of_mut!((*out_).cells_len).write(cells_len);
     addr_of_mut!((*out_).styles_len).write(styles_len);
     addr_of_mut!((*out_).graphemes_len).write(graphemes_len);
     addr_of_mut!((*out_).grapheme_bytes_len).write(bytes_len);
     if (cells_len > 0 && out_cells.is_null())
         || cells_len > cells_cap
-        || out_styles.is_null()
-        || styles_len > styles_cap
-        || (graphemes_len > 0 && out_graphemes.is_null())
-        || graphemes_len > graphemes_cap
-        || (bytes_len > 0 && out_bytes.is_null())
-        || bytes_len > bytes_cap
+        || styles.out.is_null()
+        || styles_len > styles.cap
+        || (graphemes_len > 0 && graphemes.out.is_null())
+        || graphemes_len > graphemes.cap
+        || (bytes_len > 0 && graphemes.bytes.is_null())
+        || bytes_len > graphemes.bytes_cap
     {
         return Result::OutOfSpace;
     }
     Result::Success
+}
+
+/// `CopyRun::previous_key` when there is no previous styled cell to
+/// match. Real keys never have bit 0 set.
+const COPY_NO_KEY: u64 = 1;
+
+/// What `copy_run` carries from one cell to the next.
+struct CopyRun {
+    /// The x of the previous styled cell, or `POSITION_NONE`.
+    previous_x: usize,
+    /// The style table index of the previous styled cell.
+    previous_style: u16,
+    /// The style ID bits of the previous styled cell when it is a
+    /// codepoint cell, else `COPY_NO_KEY`.
+    previous_key: u64,
+}
+
+/// Copies `row.raw[from..to]`, writing each cell to `out` when `WRITE`
+/// is true and only collecting styles and graphemes otherwise.
+///
+/// Zig compares every styled cell's style with the previous styled
+/// cell's style. Here a styled codepoint cell whose style ID equals the
+/// previous one's skips that compare: both styles were copied from the
+/// same page entry when the row was built, so the compare would match.
+/// Background color cells can't take this shortcut because their style
+/// comes from their content.
+#[inline(always)]
+fn copy_run<const WRITE: bool>(
+    row: &renderpkg::Cells,
+    from: usize,
+    to: usize,
+    out: *mut CopiedCell,
+    styles: &mut CopyStyles,
+    graphemes: &mut CopyGraphemes,
+    state: &mut CopyRun,
+) -> std::result::Result<(), Result> {
+    use page::cell_fields as f;
+    const STYLE_ID: u64 = f::STYLE_ID.mask();
+    // The high bit of the content tag, set for background color cells.
+    const TAG_BG: u64 = 0b10;
+    const TAG: u64 = f::CONTENT_TAG.mask();
+    const CODEPOINT: u64 = f::CONTENT_CODEPOINT_DATA.mask();
+    const CODEPOINT_DATA: u64 = CODEPOINT >> f::CONTENT_CODEPOINT_DATA.offset;
+    const GRAPHEME: u64 = ContentTag::CodepointGrapheme as u64;
+
+    let mut previous_x = state.previous_x;
+    let mut previous_style = state.previous_style;
+    let mut previous_key = state.previous_key;
+    for (i, cell) in row.raw[from..to].iter().enumerate() {
+        let bits = cell.to_bits();
+
+        // Unstyled codepoint cells, the bulk of most rows: no style,
+        // no grapheme, and the content is the codepoint.
+        if bits & (STYLE_ID | TAG) == 0 {
+            if WRITE {
+                let low = (bits >> f::CONTENT.offset) & CODEPOINT_DATA;
+                let high = COPY_HIGH[(bits >> f::WIDE.offset) as usize & 0x3F];
+                // SAFETY: the caller's cell buffer holds the cells written.
+                unsafe { write_copied(out.add(i), (low, high)) };
+            }
+            continue;
+        }
+
+        let cx = from + i;
+
+        // Styled codepoint cells that continue the previous styled
+        // cell's style, the bulk of styled rows.
+        if bits & TAG == 0 && bits & STYLE_ID == previous_key {
+            if WRITE {
+                let low = (bits >> f::CONTENT.offset) & CODEPOINT_DATA | (previous_style as u64) << 32;
+                let high = COPY_HIGH[(bits >> f::WIDE.offset) as usize & 0x3F];
+                // SAFETY: the caller's cell buffer holds the cells written.
+                unsafe { write_copied(out.add(i), (low, high)) };
+            }
+            previous_x = cx;
+            continue;
+        }
+
+        let mut style_index: u16 = 0;
+        if bits & STYLE_ID != 0 {
+            let key = bits & (STYLE_ID | TAG_BG);
+            if key == previous_key {
+                style_index = previous_style;
+            } else {
+                style_index = styles.index(&row.style, cx, previous_x, previous_style);
+                previous_key = if bits & TAG_BG == 0 { key } else { COPY_NO_KEY };
+            }
+            previous_x = cx;
+            previous_style = style_index;
+        }
+
+        // A grapheme cell with text (has_grapheme and has_text).
+        let mut grapheme: u16 = 0;
+        if bits & TAG == GRAPHEME && bits & CODEPOINT != 0 {
+            grapheme = graphemes.push(*cell, row.grapheme(cx))?;
+        }
+
+        if WRITE {
+            // SAFETY: the caller's cell buffer holds the cells written.
+            unsafe { write_copied(out.add(i), copied_cell(bits, style_index, grapheme)) };
+        }
+    }
+    state.previous_x = previous_x;
+    state.previous_style = previous_style;
+    state.previous_key = previous_key;
+    Ok(())
 }
 
 /// Returns the end of `raws[start..end]` without its trailing default
@@ -1552,6 +1804,14 @@ pub unsafe extern "C" fn row_get(iterator_: RowIterator, data: c_int, out: *mut 
     let y = it.y;
     if y >= it.raws.len() {
         return Result::InvalidValue;
+    }
+    // A renderer asks every row whether it is dirty on every frame, so
+    // that read skips the general dispatch. Zig's dispatch is a bare
+    // jump table; ours validates the data value first.
+    if data == RowData::Dirty as c_int && !out.is_null() {
+        // SAFETY: the row slices share one length, checked above.
+        *(out as *mut bool) = *(&*it.dirty).get_unchecked(y);
+        return Result::Success;
     }
     row_get_dispatch(it, y, data, out)
 }
@@ -2865,6 +3125,204 @@ mod tests {
             old.size -= 1;
             assert_eq!(Result::InvalidValue, row_cells_copy(cells, 0, 20, &mut old));
             free_all(terminal, state, it, cells);
+        }
+    }
+
+    /// The copied form of a cell read field by field through the cell
+    /// accessors, as Zig writes it.
+    fn reference_copied_cell(cell: page::Cell, style: u16, grapheme: u16) -> CopiedCell {
+        CopiedCell {
+            content: match cell.content_tag() {
+                ContentTag::Codepoint | ContentTag::CodepointGrapheme => cell.content_codepoint(),
+                ContentTag::BgColorPalette => cell.content_color_palette() as u32,
+                ContentTag::BgColorRgb => {
+                    let rgb = cell.content_color_rgb();
+                    ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | rgb.b as u32
+                }
+            },
+            style,
+            grapheme,
+            content_tag: cell.content_tag() as u8,
+            wide: cell.wide() as u8,
+            flags: (if cell.hyperlink() { CopiedCell::HYPERLINK } else { 0 })
+                | (if cell.protected() { CopiedCell::PROTECTED } else { 0 }),
+            semantic_content: cell.semantic_content() as u8,
+        }
+    }
+
+    #[test]
+    fn render_copied_cell_matches_the_cell_fields() {
+        use page::cell_fields as f;
+        let contents: [u64; 5] = [0, 0x41, 0x1F_FFFF, 0x12_3456, 0xFF_FFFF];
+        let mut out = [CopiedCell::default(); 2];
+        for tag in 0..4u64 {
+            for high in 0..64u64 {
+                // The fourth semantic content value is unused.
+                if high >> 4 == 3 {
+                    continue;
+                }
+                for &content in &contents {
+                    for (style, grapheme) in [(0u16, 0u16), (7, 0), (0, 3), (0xFFFF, 0xFFFF)] {
+                        let bits = tag | content << f::CONTENT.offset | 0x1234 << f::STYLE_ID.offset | high << 42;
+                        let cell = page::Cell::from_bits(bits);
+                        unsafe { write_copied(&mut out[1], copied_cell(bits, style, grapheme)) };
+                        assert_eq!(reference_copied_cell(cell, style, grapheme), out[1], "{bits:#x}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `row_cells_copy` as Zig writes it: field by field, comparing
+    /// every styled cell's style with the previous one's.
+    fn reference_copy(
+        row: &renderpkg::Cells,
+        start: usize,
+        end: usize,
+    ) -> (Vec<CopiedCell>, Vec<style_c::Style>, Vec<CopiedGrapheme>, Vec<u8>) {
+        let mut cells = Vec::new();
+        let mut styles = vec![style_c::Style::DEFAULT];
+        let mut graphemes = Vec::new();
+        let mut bytes = Vec::new();
+        let mut slots = [COPY_STYLE_SLOT_EMPTY; COPY_STYLE_SLOTS];
+        let mut previous_x = POSITION_NONE;
+        let mut previous_style = 0u16;
+        for cx in start..end {
+            let cell = row.raw[cx];
+            let mut style_index = 0u16;
+            if cell.has_styling() {
+                let s = &row.style[cx];
+                if previous_x != POSITION_NONE && row.style[previous_x].eql(s) {
+                    style_index = previous_style;
+                } else {
+                    let slot = &mut slots[(s.hash() as usize) % COPY_STYLE_SLOTS];
+                    if *slot != COPY_STYLE_SLOT_EMPTY && row.style[(*slot >> 16) as usize].eql(s) {
+                        style_index = *slot as u16;
+                    } else {
+                        style_index = styles.len() as u16;
+                        styles.push(style_c::Style::from_style(s));
+                        *slot = ((cx as u32) << 16) | style_index as u32;
+                    }
+                }
+                previous_x = cx;
+                previous_style = style_index;
+            }
+            let mut grapheme = 0u16;
+            if cell.has_grapheme() && cell.has_text() {
+                let mut buf = [0u8; 64];
+                let mut b = Buffer {
+                    ptr: buf.as_mut_ptr(),
+                    cap: buf.len(),
+                    len: 0,
+                };
+                assert_eq!(Result::Success, row_cells_get_graphemes_utf8(cell, row.grapheme(cx), &mut b));
+                graphemes.push(CopiedGrapheme {
+                    offset: bytes.len() as u32,
+                    len: b.len as u32,
+                });
+                bytes.extend_from_slice(&buf[..b.len]);
+                grapheme = graphemes.len() as u16;
+            }
+            cells.push(reference_copied_cell(cell, style_index, grapheme));
+        }
+        (cells, styles, graphemes, bytes)
+    }
+
+    #[test]
+    fn render_row_cells_copy_matches_a_field_by_field_copy() {
+        // Styles that repeat apart and many distinct ones (slot
+        // collisions), background color cells, protected, hyperlinked,
+        // prompt and input cells, wide characters and graphemes.
+        let tokens: [&str; 22] = [
+            "abc ",
+            "\x1b[1;31m",
+            "\x1b[0m",
+            "\x1b[4m",
+            "\x1b[38;2;%;%;%m",
+            "\x1b[48;5;%m",
+            "\x1b[48;5;%m\x1b[K",
+            "\x1b[48;2;%;%;%m\x1b[2X",
+            "\x1b[1\"q",
+            "\x1b[0\"q",
+            "\x1b]8;;http://x\x1b\\",
+            "\x1b]8;;\x1b\\",
+            "\x1b]133;A\x07",
+            "\x1b]133;B\x07",
+            "\x1b]133;C\x07",
+            "\u{4E2D}\u{6587}",
+            "e\u{301}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+            "\r\n",
+            "\x1b[%G",
+            "xyz",
+            "\x1b[3;9H",
+        ];
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for _ in 0..24 {
+            let cols: u16 = 41;
+            let terminal = new_terminal(cols, 6);
+            let mut input = String::new();
+            for _ in 0..300 {
+                for part in tokens[next(tokens.len() as u64) as usize].split('%').enumerate() {
+                    if part.0 > 0 {
+                        input.push_str(&next(256).to_string());
+                    }
+                    input.push_str(part.1);
+                }
+            }
+            write(terminal, input.as_bytes());
+
+            let state = new_state();
+            unsafe {
+                assert_eq!(Result::Success, update(state, terminal));
+                let it = row_iter(state);
+                let mut cells = new_row_cells();
+                let mut copied = vec![CopiedCell::default(); cols as usize];
+                let mut styles = vec![style_c::Style::DEFAULT; cols as usize + 1];
+                let mut graphemes = vec![CopiedGrapheme::default(); cols as usize];
+                let mut bytes = vec![0u8; 64 * cols as usize];
+                while row_iterator_next(it) {
+                    assert_eq!(Result::Success, row_get_(it, RowData::Cells, &mut cells));
+                    let row = (*cells).cells();
+                    for (x, flags) in [(0u16, 0), (0, RowCellsCopy::TRIM), (5, RowCellsCopy::TRIM)] {
+                        let mut out = RowCellsCopy {
+                            cells: copied.as_mut_ptr(),
+                            cells_cap: copied.len(),
+                            styles: styles.as_mut_ptr(),
+                            styles_cap: styles.len(),
+                            graphemes: graphemes.as_mut_ptr(),
+                            graphemes_cap: graphemes.len(),
+                            grapheme_bytes: bytes.as_mut_ptr(),
+                            grapheme_bytes_cap: bytes.len(),
+                            flags,
+                            ..Default::default()
+                        };
+                        assert_eq!(Result::Success, row_cells_copy(cells, x, cols, &mut out));
+                        let mut end = cols as usize;
+                        if flags & RowCellsCopy::TRIM != 0 {
+                            while end > x as usize && row.raw[end - 1].is_zero() {
+                                end -= 1;
+                            }
+                        }
+                        let (want_cells, want_styles, want_graphemes, want_bytes) =
+                            reference_copy(row, x as usize, end);
+                        assert_eq!(want_cells.as_slice(), &copied[..out.cells_len]);
+                        assert_eq!(want_styles.len(), out.styles_len);
+                        for (want, got) in want_styles.iter().zip(&styles) {
+                            expect_copied_style(want, got);
+                        }
+                        assert_eq!(want_graphemes.as_slice(), &graphemes[..out.graphemes_len]);
+                        assert_eq!(want_bytes.as_slice(), &bytes[..out.grapheme_bytes_len]);
+                    }
+                }
+                free_all(terminal, state, it, cells);
+            }
         }
     }
 
