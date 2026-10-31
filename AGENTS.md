@@ -19,6 +19,10 @@ mirrored snake_case path, names follow the Zig ones, and tests are ported alongs
 | `cargo rustc --release --no-default-features --features lib-vt --lib --crate-type staticlib` | `target/release/libghostty.a`, for C programs and comparisons against the Zig library |
 | `cargo build --release --no-default-features --features app` | The app and the `ghostty-bench`/`ghostty-gen` tools (macOS needs gettext for tests, see README) |
 
+| `tools/zig_reference.sh ZZ_CHECKOUT` | Builds zz's Zig libghostty-vt into `target/zig-reference` (needs zz's pinned Zig) |
+| `test/differential/run.sh target/zig-reference` | Replays one operation log through both engines at 13 write-chunk sizes; every snapshot must match |
+| `bench/run.sh target/zig-reference` | Times zz's hot paths through the C API on both engines (`--only`, `--runs`, `--json`); a ratio above 1 means Rust is slower |
+
 The repo's `.cargo/config.toml` limits builds to two jobs for a small box; set
 `CARGO_BUILD_JOBS` higher on bigger machines.
 
