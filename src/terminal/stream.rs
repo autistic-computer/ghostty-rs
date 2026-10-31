@@ -757,7 +757,10 @@ impl<H: Handler> Stream<H> {
             parser,
             utf8decoder: Utf8Decoder::default(),
             continuation: tracker,
-            cp_buf: vec![0; CP_BUF_LEN],
+            // Allocated by the first slice that needs it, sized to that
+            // slice (Zig leaves its inline buffer undefined; zeroing 16 KiB
+            // per terminal showed up when terminals are created often).
+            cp_buf: Vec::new(),
         }
     }
 
@@ -962,17 +965,19 @@ impl<H: Handler> Stream<H> {
         }
 
         // Take the codepoint buffer out of self so the handler can be
-        // called with slices of it. If a previous call panicked while the
-        // buffer was out, it is recreated.
+        // called with slices of it. It grows to the largest chunk seen, up to
+        // CP_BUF_LEN; if a previous call panicked while it was out, it is
+        // recreated.
         let mut cp_buf = std::mem::take(&mut self.cp_buf);
-        if cp_buf.len() != CP_BUF_LEN {
-            cp_buf = vec![0; CP_BUF_LEN];
+        let needed = CP_BUF_LEN.min(input.len());
+        if cp_buf.len() < needed {
+            cp_buf = vec![0; needed.next_power_of_two().min(CP_BUF_LEN)];
         }
 
         // Split the input into chunks that fit into cp_buf.
         let mut i = 0;
         loop {
-            let len = CP_BUF_LEN.min(input.len() - i);
+            let len = cp_buf.len().min(input.len() - i);
             self.next_slice_capped::<UNTIL>(&input[i..i + len], &mut cp_buf, u);
             if UNTIL && u.stop.is_some() {
                 break;
