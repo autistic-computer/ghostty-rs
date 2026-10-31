@@ -34,9 +34,16 @@ pub static DECODE_PNG: RwLock<Option<DecodePngFn>> = RwLock::new(
     if matches!(build_options::ARTIFACT, build_options::Artifact::Lib) {
         None
     } else {
-        Some(decode_png_default as DecodePngFn)
+        DECODE_PNG_DEFAULT
     },
 );
+
+/// The application's default PNG decoder. Without the `app` feature the
+/// artifact is always libghostty-vt, which has none (and no `png` crate).
+#[cfg(feature = "app")]
+const DECODE_PNG_DEFAULT: Option<DecodePngFn> = Some(decode_png_default);
+#[cfg(not(feature = "app"))]
+const DECODE_PNG_DEFAULT: Option<DecodePngFn> = None;
 
 /// The current PNG decoder (reads [`DECODE_PNG`]).
 pub fn decode_png() -> Option<DecodePngFn> {
@@ -135,6 +142,7 @@ pub(crate) static DECODE_PNG_TEST_LOCK: RwLock<()> = RwLock::new(());
 
 /// The default PNG decoder (`decodePngWuffs` in Zig). Produces 8-bit
 /// non-premultiplied RGBA.
+#[cfg(feature = "app")]
 fn decode_png_default(data: &[u8]) -> Result<Image, DecodeError> {
     use png::{ColorType, Transformations};
 
@@ -194,6 +202,7 @@ fn decode_png_default(data: &[u8]) -> Result<Image, DecodeError> {
     })
 }
 
+#[cfg(feature = "app")]
 fn map_png_error(err: png::DecodingError) -> DecodeError {
     match err {
         png::DecodingError::LimitsExceeded => DecodeError::OutOfMemory,
@@ -303,6 +312,11 @@ mod tests {
 
     #[test]
     fn decode_png_rgba() {
+        // libghostty-vt has no default PNG decoder.
+        if matches!(build_options::ARTIFACT, build_options::Artifact::Lib) {
+            return;
+        }
+
         // Encode a 2x1 RGB image and decode it back as RGBA.
         let mut encoded = Vec::new();
         {

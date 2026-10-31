@@ -701,6 +701,7 @@ impl Modifier {
     }
 
     /// Used by config formatter
+    #[cfg(feature = "app")]
     pub fn format_entry(
         &self,
         formatter: &mut crate::config::formatter::EntryFormatter<'_>,
@@ -815,9 +816,11 @@ impl std::str::FromStr for Key {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "app")]
     use crate::config::formatter::entry_formatter;
 
     #[test]
+    #[cfg(feature = "app")]
     fn format_config_percent() {
         let mut buf = String::new();
         let p = Modifier::parse_cli(Some("24%")).unwrap();
@@ -826,6 +829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn format_config_absolute() {
         let mut buf = String::new();
         let p = Modifier::parse_cli(Some("-30")).unwrap();

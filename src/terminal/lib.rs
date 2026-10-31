@@ -61,6 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "lib-vt"))]
     fn target_is_zig_for_app_build() {
         assert_eq!(TARGET, lib::Target::Zig);
         assert_eq!(CALLING_CONV, CallingConvention::C);

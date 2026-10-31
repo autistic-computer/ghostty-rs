@@ -30,7 +30,8 @@ cargo run --release -- +version  # CLI actions work as in Ghostty
 cargo test --lib                 # the ported test suite
 ```
 
-`cargo build --no-default-features` builds without the GTK runtime.
+`cargo build --no-default-features --features app` builds without the GTK
+runtime.
 `--features inspector` enables the Dear ImGui terminal inspector.
 `ghostty-bench` and `ghostty-gen` are the benchmark and synthetic-data tools;
 `ghostty-build-data` generates the terminfo, completion and syntax files.
@@ -71,6 +72,22 @@ cc app.c $(pkg-config --cflags --libs libghostty-vt)                            
 cc -DGHOSTTY_STATIC app.c $(pkg-config --cflags --static --libs libghostty-vt-static)  # static
 ```
 
+Rust projects can depend on the crate directly and link the C API from it
+instead of a separate libghostty-vt build:
+
+```toml
+ghostty = { path = "../ghrossty", default-features = false, features = ["lib-vt"] }
+```
+
+The `lib-vt` feature selects the lib-vt terminal options, and without the
+default `app` feature only the terminal, its C API and the few pieces of
+`input`, `font`, `os` and `renderer` it reaches are compiled: no app, apprt,
+renderer, config or embedding API (`ghostty_app_*`, `ghostty_surface_*`,
+...), no pkg-config, C compiler or system libraries. The `ghostty_*`
+functions are defined in the rlib; a crate that only declares them in an
+`extern "C"` block must still name the crate (`use ghostty as _;`) so it is
+linked.
+
 CMake projects can use `CMakeLists.txt` (the upstream wrapper, driving cargo):
 `FetchContent` / `add_subdirectory` gives the `ghostty-vt` and
 `ghostty-vt-static` targets, `cmake --install` plus `find_package(ghostty-vt)`
@@ -89,22 +106,27 @@ examples are Rust examples of the crate's API:
 Build the standalone static library without app dependencies:
 
 ```sh
-GHOSTTY_LIB_VT=1 CARGO_TARGET_DIR=target/lib-vt \
-  cargo rustc --release --no-default-features --lib --crate-type staticlib
+CARGO_TARGET_DIR=target/lib-vt \
+  cargo rustc --release --no-default-features --features lib-vt --lib --crate-type staticlib
 ```
 
 The archive is `target/lib-vt/release/libghostty.a`. The existing
 `tools/build_lib_vt.sh` packaging script targets Linux/ELF.
 
-The terminal test target includes app code and needs the static gettext
-archive on macOS. With the app build dependencies and gettext installed:
+The terminal and decoder tests need nothing else in lib-vt mode:
+
+```sh
+cargo test --no-default-features --features lib-vt --lib terminal::
+cargo test --no-default-features --features lib-vt --lib simd::vt::
+```
+
+With the app (`--features app`), the test target needs the static gettext
+archive on macOS:
 
 ```sh
 RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$(brew --prefix gettext)/lib/libintl.a -l dylib=iconv -C link-arg=-framework -C link-arg=CoreFoundation" \
-  cargo test --no-default-features --lib terminal::
+  cargo test --no-default-features --features app --lib terminal::
 ```
-
-Use the same link flags with `simd::vt::` to run the decoder tests.
 
 ## The macOS app
 
@@ -124,8 +146,10 @@ macos/build.nu --configuration Debug     # -> macos/build/Debug/Ghostty.app
 
 ## Testing
 
-- `cargo test --no-default-features --lib terminal::`: terminal unit tests.
-- `cargo test --no-default-features --lib simd::vt::`: decoder unit tests.
+- `cargo test --no-default-features --features lib-vt --lib terminal::`:
+  terminal unit tests (`--features app` for the app build options).
+- `cargo test --no-default-features --features lib-vt --lib simd::vt::`:
+  decoder unit tests.
 - `test/esctest/run.sh`: esctest conformance tests for libghostty-vt.
 - `test/fuzz-libghostty`: fuzz harnesses and committed regression corpora.
 - `example/build_all.sh`: build and run the C/C++ API examples.

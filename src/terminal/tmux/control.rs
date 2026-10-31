@@ -18,6 +18,7 @@
 
 use std::fmt;
 
+#[cfg(feature = "app")]
 use crate::pkg::oniguruma as oni;
 use crate::terminal::tmux::output::parse_int_usize;
 
@@ -220,6 +221,7 @@ impl Parser {
     /// group ranges. `Err` is a regex initialization failure; `Ok(None)`
     /// means the line did not match (the Zig code logs and breaks out of
     /// the command block in that case).
+    #[cfg(feature = "app")]
     fn search(pattern: &[u8], cmd: &[u8], line: &[u8]) -> Result<Option<Captures>, ParseError> {
         let mut re = match oni::Regex::init(
             pattern,
@@ -261,6 +263,13 @@ impl Parser {
                 .map(|(&s, &e)| (s as usize, e as usize))
                 .collect(),
         ))
+    }
+
+    /// Without the app there is no Oniguruma (libghostty-vt has no tmux
+    /// control mode), so no notification can be parsed.
+    #[cfg(not(feature = "app"))]
+    fn search(_pattern: &[u8], _cmd: &[u8], _line: &[u8]) -> Result<Option<Captures>, ParseError> {
+        Err(ParseError::RegexError)
     }
 
     fn parse_notification(&mut self) -> Result<Option<Notification<'_>>, ParseError> {
@@ -670,7 +679,7 @@ impl fmt::Display for Notification<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 mod tests {
     use super::*;
     use crate::pkg::oniguruma::testing::ensure_init;

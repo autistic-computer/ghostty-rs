@@ -25,6 +25,7 @@ pub mod screen;
 pub mod sliding_window;
 #[path = "search/terminal.rs"]
 pub mod terminal;
+#[cfg(feature = "app")]
 #[path = "search/thread.rs"]
 pub mod thread;
 #[path = "search/viewport.rs"]
@@ -37,6 +38,7 @@ pub use self::active::ActiveSearch;
 pub use self::pagelist::PageListSearch;
 pub use self::screen::ScreenSearch;
 pub use self::terminal::TerminalSearch;
+#[cfg(feature = "app")]
 pub use self::thread::Thread;
 pub use self::viewport::ViewportSearch;
 

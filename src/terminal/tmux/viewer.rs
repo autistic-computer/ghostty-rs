@@ -2050,16 +2050,20 @@ mod tests {
         );
     }
 
+    // The control mode parser needs Oniguruma, which only the app has.
     #[test]
+    #[cfg(feature = "app")]
     fn tmux_raw_startup_selects_primary_screen() {
         test_raw_startup_screen(false);
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn tmux_raw_startup_selects_alternate_screen() {
         test_raw_startup_screen(true);
     }
 
+    #[cfg(feature = "app")]
     fn test_raw_startup_screen(alternate_on: bool) {
         let mut parser = control::Parser::default();
         let mut viewer = Viewer::init();

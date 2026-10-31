@@ -57,7 +57,8 @@ pub fn read_to_end_alloc<R: Read>(
     Ok(result)
 }
 
-#[cfg(test)]
+// `os::temp_dir` is part of the app.
+#[cfg(all(test, feature = "app"))]
 mod tests {
     use super::*;
     use crate::os::temp_dir::TempDir;

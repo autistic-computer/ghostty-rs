@@ -601,9 +601,11 @@ mod tests {
     const ARTIFACT_IS_GHOSTTY: bool = matches!(build_options::ARTIFACT, Artifact::Ghostty);
 
     /// `termio.Message.WriteReq.Small.Max`
+    #[cfg(feature = "app")]
     const WRITE_REQ_SMALL_MAX: usize = crate::termio::message::WriteReqSmall::MAX;
 
     #[test]
+    #[cfg(feature = "app")]
     fn keys() {
         if !ARTIFACT_IS_GHOSTTY {
             // Don't want to bring in termio into libghostty-vt

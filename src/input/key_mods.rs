@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use indexmap::IndexMap;
 
+#[cfg(feature = "app")]
 use crate::config::formatter::{self, EntryFormatter};
 use super::config::OptionAsAlt;
 
@@ -508,6 +509,7 @@ impl RemapSet {
     }
 
     /// Used by Formatter. Required by Config.
+    #[cfg(feature = "app")]
     pub fn format_entry(
         &self,
         formatter: &mut EntryFormatter<'_>,
@@ -739,6 +741,7 @@ impl Mask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "app")]
     use crate::config::formatter::entry_formatter;
 
     fn m(f: impl FnOnce(&mut Mods)) -> Mods {
@@ -1043,6 +1046,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn remap_set_format_entry_empty() {
         let mut buf = String::new();
 
@@ -1053,6 +1057,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn remap_set_format_entry_single_sided() {
         let mut buf = String::new();
 
@@ -1067,6 +1072,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn remap_set_format_entry_unsided_creates_two_entries() {
         let mut buf = String::new();
 
@@ -1084,6 +1090,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn remap_set_format_entry_right_sided() {
         let mut buf = String::new();
 

@@ -378,9 +378,8 @@ impl Options {
     /// with the overrides of `GhosttyZig.zig` (`artifact = .lib`,
     /// `oniguruma = false`, and `c_abi = true` for the `vt_c` module). The
     /// version is the libghostty-vt version (`build.zig` `lib_version`).
-    /// The crate is built with these options when compiled with
-    /// `--cfg ghostty_lib_vt` (`GHOSTTY_LIB_VT=1`, see
-    /// `tools/build_lib_vt.sh`).
+    /// The crate is built with these options with the `lib-vt` feature
+    /// (see `tools/build_lib_vt.sh`).
     pub const fn lib_vt() -> Options {
         Options {
             artifact: Artifact::Lib,
@@ -476,19 +475,19 @@ const LIB_VERSION_STRING: &str = env_or(option_env!("GHOSTTY_LIB_VT_VERSION_STRI
 
 // ---------------------------------------------------------------------------
 // The `terminal_options` module values (what `Options.add` emits) for the
-// Ghostty application build, or for libghostty-vt's C library when the
-// crate is compiled with `--cfg ghostty_lib_vt`.
+// Ghostty application build, or for libghostty-vt's C library with the
+// `lib-vt` feature.
 // ---------------------------------------------------------------------------
 
 /// The options this crate is built with.
-pub const OPTIONS: Options = if cfg!(ghostty_lib_vt) {
+pub const OPTIONS: Options = if cfg!(feature = "lib-vt") {
     Options::lib_vt()
 } else {
     Options::ghostty()
 };
 
 /// `terminal_options.artifact`: the target artifact. The Ghostty
-/// application, or `Lib` for libghostty-vt (`--cfg ghostty_lib_vt`).
+/// application, or `Lib` for libghostty-vt (the `lib-vt` feature).
 pub const ARTIFACT: Artifact = OPTIONS.artifact;
 
 /// `terminal_options.c_abi`: whether the terminal package exports a C ABI.
@@ -531,11 +530,11 @@ pub const GLYPH_PROTOCOL: bool = OPTIONS.features.glyph_protocol;
 pub const KITTY_GRAPHICS: bool = OPTIONS.kitty_graphics_current_target();
 
 /// `terminal_options.version_string`: the full version string.
-pub const VERSION_STRING: &str = if cfg!(ghostty_lib_vt) {
-    LIB_VERSION_STRING
-} else {
-    crate::build_config::VERSION_STRING
-};
+#[cfg(feature = "lib-vt")]
+pub const VERSION_STRING: &str = LIB_VERSION_STRING;
+/// `terminal_options.version_string`: the full version string.
+#[cfg(not(feature = "lib-vt"))]
+pub const VERSION_STRING: &str = crate::build_config::VERSION_STRING;
 /// `terminal_options.version_major`.
 pub const VERSION_MAJOR: usize = OPTIONS.version.major;
 /// `terminal_options.version_minor`.
@@ -622,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(ghostty_lib_vt))]
+    #[cfg(not(feature = "lib-vt"))]
     fn ghostty_app_options() {
         assert_eq!(ARTIFACT, Artifact::Ghostty);
         assert!(!C_ABI);

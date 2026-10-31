@@ -13,35 +13,32 @@ mod gresource;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(ghostty_gresource)");
-    // `tools/build_lib_vt.sh` builds libghostty-vt (the `ghostty_*` terminal
-    // C API, like `zig build -Demit-lib-vt`) with `GHOSTTY_LIB_VT=1`. Like
-    // the Zig lib-vt, that library uses none of the app's C libraries
-    // (freetype, harfbuzz, fontconfig, oniguruma, EGL, glad, stb), so they
-    // are neither compiled nor required then; the script's link step
-    // garbage-collects everything the C API does not reach, and fails if
-    // the C API ever started to depend on one of them.
-    println!("cargo:rerun-if-env-changed=GHOSTTY_LIB_VT");
-    println!("cargo:rustc-check-cfg=cfg(ghostty_lib_vt)");
-    if std::env::var_os("GHOSTTY_LIB_VT").is_some() {
+    // The `lib-vt` feature builds libghostty-vt (the `ghostty_*` terminal C
+    // API, like `zig build -Demit-lib-vt`). Like the Zig lib-vt, without the
+    // `app` feature it uses none of the app's C libraries (freetype,
+    // harfbuzz, fontconfig, oniguruma, EGL, glad, stb), so nothing is
+    // probed, compiled or linked here.
+    if std::env::var_os("CARGO_FEATURE_LIB_VT").is_some() {
         lib_vt_options();
-    } else {
+    }
+    #[cfg(feature = "app")]
+    {
         pkg_c_libraries();
         stb();
+        dcimgui();
+        if std::env::var_os("CARGO_FEATURE_GTK").is_some() {
+            gtk_resources();
+        }
     }
-    dcimgui();
     app_version();
-    if std::env::var_os("CARGO_FEATURE_GTK").is_some() {
-        gtk_resources();
-    }
 }
 
 /// The libghostty-vt build options (`GhosttyZig.zig`'s `vt_c` module): the
-/// crate is compiled with `--cfg ghostty_lib_vt`, which selects
-/// `terminal::build_options::Options::lib_vt()`, and the library version
+/// `lib-vt` feature selects `terminal::build_options::Options::lib_vt()`,
+/// and the library version
 /// (`build.zig` `lib_version`, or `GHOSTTY_LIB_VT_VERSION` like Zig's
 /// `-Dlib-version-string`) is passed split into its semantic version parts.
 fn lib_vt_options() {
-    println!("cargo:rustc-cfg=ghostty_lib_vt");
     println!("cargo:rerun-if-env-changed=GHOSTTY_LIB_VT_VERSION");
     let version = std::env::var("GHOSTTY_LIB_VT_VERSION").unwrap_or_else(|_| "0.1.0-dev".into());
     let (rest, build) = match version.split_once('+') {
@@ -80,6 +77,7 @@ fn lib_vt_options() {
 ///   which `gresource::register` embeds. The `.ui` files are generated from
 ///   the Blueprints ahead of time by `tools/gen_gtk_ui.sh` and committed, so
 ///   the build never needs `blueprint-compiler`.
+#[cfg(feature = "app")]
 fn gtk_resources() {
     use std::path::PathBuf;
     use std::process::Command;
@@ -135,6 +133,7 @@ fn gtk_resources() {
 
 /// The vendored nothings/stb headers (`src/stb`), compiled from
 /// `src/stb/stb.c` as `src/build/SharedDeps.zig` does.
+#[cfg(feature = "app")]
 fn stb() {
     if cross_checking_macos() {
         return;
@@ -151,6 +150,7 @@ fn stb() {
 /// opengl/glad). The system libraries are linked via pkg-config (the Zig
 /// build's "system integration" mode); glad is always compiled statically
 /// from `vendor/glad`, as `src/build/SharedDeps.zig` does.
+#[cfg(feature = "app")]
 fn pkg_c_libraries() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
@@ -198,6 +198,7 @@ fn pkg_c_libraries() {
 
 /// Dear ImGui + the Dear Bindings C API (`pkg/dcimgui/build.zig`), only with
 /// the `inspector` feature. Sources are vendored in `vendor/dcimgui`.
+#[cfg(feature = "app")]
 fn dcimgui() {
     if std::env::var_os("CARGO_FEATURE_INSPECTOR").is_none() {
         return;
@@ -274,6 +275,7 @@ fn dcimgui() {
 
 /// True when type-checking for macOS from a non-macOS host: C sources can't
 /// be compiled for that target here, and nothing is linked anyway.
+#[cfg(feature = "app")]
 fn cross_checking_macos() -> bool {
     std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "macos" && !cfg!(target_os = "macos")
 }

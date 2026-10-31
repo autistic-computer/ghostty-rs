@@ -17,16 +17,15 @@
 # functions defined in `src/terminal/c/**` and `src/lib_vt.rs` (declared in
 # `include/ghostty/vt*.h`). How:
 #
-#  1. `cargo rustc --crate-type staticlib` builds the crate (no default
-#     features, so no GTK) into a separate target dir (`target/lib-vt`), so
-#     the normal `cargo build` is neither slowed down nor changed. With
-#     `GHOSTTY_LIB_VT=1`, `build.rs` skips the app's C libraries (freetype,
-#     harfbuzz, fontconfig, oniguruma, EGL, glad, stb): like the Zig lib-vt,
+#  1. `cargo rustc --crate-type staticlib` builds the crate with only the
+#     `lib-vt` feature (no app, so no GTK, renderer, fonts or the
+#     `ghostty_app_*`/`ghostty_surface_*`/`ghostty_config_*` embedding API)
+#     into a separate target dir (`target/lib-vt`), so the normal
+#     `cargo build` is neither slowed down nor changed. Like the Zig lib-vt,
 #     the result only needs libc (+ libgcc_s for Rust's unwinder).
 #  2. `ld -r --gc-sections` partially links the archive into one relocatable
 #     object rooted at the exported functions, dropping everything the C API
-#     does not reach (the app, renderer, fonts, the `ghostty_app_*`/
-#     `ghostty_surface_*`/`ghostty_config_*` embedding API, ...).
+#     does not reach.
 #  3. `objcopy --keep-global-symbols` makes every other symbol (Rust std,
 #     compiler builtins, crate internals) local, so the static library
 #     can't clash with other Rust code linked into the same program.
@@ -98,7 +97,7 @@ AR="${AR:-ar}"
 
 # 1. The crate as a static library.
 cargo_args=(rustc --manifest-path "$ROOT/Cargo.toml" --lib --crate-type staticlib
-    --no-default-features --profile "$profile" --target-dir "$target_dir")
+    --no-default-features --features lib-vt --profile "$profile" --target-dir "$target_dir")
 out_dir="$target_dir"
 if [ -n "$target" ]; then
     cargo_args+=(--target "$target")
@@ -106,7 +105,7 @@ if [ -n "$target" ]; then
 fi
 [ "$profile" = dev ] && out_dir="$out_dir/debug" || out_dir="$out_dir/$profile"
 # shellcheck disable=SC2086
-GHOSTTY_LIB_VT=1 GHOSTTY_LIB_VT_VERSION="$version" "$CARGO" "${cargo_args[@]}" ${GHOSTTY_LIB_VT_CARGO_FLAGS:-}
+GHOSTTY_LIB_VT_VERSION="$version" "$CARGO" "${cargo_args[@]}" ${GHOSTTY_LIB_VT_CARGO_FLAGS:-}
 archive="$out_dir/libghostty.a"
 
 work="$out_dir/libghostty-vt"

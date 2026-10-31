@@ -21,7 +21,7 @@ mkdir -p "$share"
 
 # The build-data generator runs on the host, like Zig's `b.graph.host`.
 # shellcheck disable=SC2086
-cargo build -q --release --no-default-features --bin ghostty-build-data ${CARGO_BUILD_ARGS:-}
+cargo build -q --release --no-default-features --features app --bin ghostty-build-data ${CARGO_BUILD_ARGS:-}
 gen=target/release/ghostty-build-data
 
 # Terminfo: source, termcap, and the compiled database.

@@ -39,7 +39,7 @@ for target in "${targets[@]}"; do
   rustup target add "$target" >/dev/null
   # libghostty for the embedded apprt; the GTK runtime is not used on macOS.
   cargo rustc --lib "${cargo_profile[@]}" --target "$target" \
-    --no-default-features --crate-type staticlib \
+    --no-default-features --features app --crate-type staticlib \
     -- --print native-static-libs 2> "target/$target-native-libs.txt" || {
       cat "target/$target-native-libs.txt" >&2; exit 1; }
   libs+=("target/$target/$dir/libghostty.a")

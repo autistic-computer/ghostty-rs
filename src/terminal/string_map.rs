@@ -10,6 +10,7 @@
 //! - The search iterator and matches borrow the map and the regex instead
 //!   of copying them.
 
+#[cfg(feature = "app")]
 use crate::pkg::oniguruma as oni;
 use crate::terminal::build_options;
 use crate::terminal::formatter::PinMapMap;
@@ -19,6 +20,7 @@ use crate::terminal::selection::Selection;
 //
 // Units are Oniguruma retry steps (internal backtracking/retry counter),
 // not bytes/characters/time.
+#[cfg(feature = "app")]
 const ONI_SEARCH_RETRY_LIMIT: usize = 100_000;
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +37,7 @@ impl StringMap {
 
     /// Returns an iterator that yields the next match of the given regex.
     /// Requires Ghostty to be compiled with regex support.
+    #[cfg(feature = "app")]
     pub fn search_iterator<'a>(&'a self, regex: &'a mut oni::Regex) -> SearchIterator<'a> {
         debug_assert!(build_options::ONIGURUMA);
         SearchIterator {
@@ -46,12 +49,14 @@ impl StringMap {
 }
 
 /// Iterates over the regular expression matches of the string.
+#[cfg(feature = "app")]
 pub struct SearchIterator<'a> {
     pub map: &'a StringMap,
     pub regex: &'a mut oni::Regex,
     pub offset: usize,
 }
 
+#[cfg(feature = "app")]
 impl<'a> SearchIterator<'a> {
     /// Returns the next regular expression match or null if there are
     /// no more matches.
@@ -103,12 +108,14 @@ impl<'a> SearchIterator<'a> {
 }
 
 /// A single regular expression match.
+#[cfg(feature = "app")]
 pub struct Match<'a> {
     pub map: &'a StringMap,
     pub offset: usize,
     pub region: oni::Region,
 }
 
+#[cfg(feature = "app")]
 impl Match<'_> {
     pub fn deinit(&mut self) {
         self.region.deinit();
@@ -149,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn string_map_search_iterator() {
         if !build_options::ONIGURUMA {
             return;
@@ -187,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn string_map_search_iterator_url_detection() {
         if !build_options::ONIGURUMA {
             return;
@@ -229,6 +238,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]
     fn string_map_search_iterator_url_with_click_position() {
         if !build_options::ONIGURUMA {
             return;

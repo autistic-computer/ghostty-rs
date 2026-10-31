@@ -220,9 +220,16 @@ pub struct LibcAllocator;
 
 impl LibcAllocator {
     fn needs_aligned(alignment: u8) -> bool {
-        (1usize << alignment) > std::mem::align_of::<libc::max_align_t>()
+        (1usize << alignment) > MALLOC_ALIGN
     }
 }
+
+/// `alignof(max_align_t)`, what malloc guarantees. The libc crate has no
+/// `max_align_t` off Unix; Windows' malloc aligns to two pointers.
+#[cfg(unix)]
+const MALLOC_ALIGN: usize = std::mem::align_of::<libc::max_align_t>();
+#[cfg(not(unix))]
+const MALLOC_ALIGN: usize = 2 * std::mem::size_of::<usize>();
 
 impl ZigAllocator for LibcAllocator {
     fn alloc(&self, len: usize, alignment: u8, _ra: usize) -> *mut u8 {

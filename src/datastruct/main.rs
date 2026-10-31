@@ -24,6 +24,7 @@ pub mod limited_allocator;
 pub mod message_data;
 #[path = "segmented_list.rs"]
 pub mod segmented_list;
+#[cfg(feature = "app")]
 #[path = "split_tree.rs"]
 pub mod split_tree;
 #[path = "untouched_pool.rs"]
@@ -39,6 +40,7 @@ pub use comptime_int_set::ComptimeIntSet;
 pub use intrusive_linked_list::DoublyLinkedList as IntrusiveDoublyLinkedList;
 pub use limited_allocator::LimitedAllocator;
 pub use message_data::MessageData;
+#[cfg(feature = "app")]
 pub use split_tree::SplitTree;
 pub use untouched_pool::UntouchedPool;
 #[cfg(any(target_arch = "wasm32", test))]

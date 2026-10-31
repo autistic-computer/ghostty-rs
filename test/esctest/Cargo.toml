@@ -10,7 +10,7 @@ publish = false
 [workspace]
 
 [dependencies]
-ghostty = { path = "../..", default-features = false }
+ghostty = { path = "../..", default-features = false, features = ["lib-vt"] }
 libc = "0.2"
 log = "0.4"
 

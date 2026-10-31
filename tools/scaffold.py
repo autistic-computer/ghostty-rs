@@ -137,9 +137,23 @@ def scaffold(tree, rs_tree, root_file, EXCLUDE_DIRS, status):
         add_child(parent, snake(os.path.basename(d)), rs)
 
     # Write files
-    def gen_block(mods):
+    def block_cfgs(text):
+        """`#[cfg(...)]` attributes of each module in an existing block,
+        kept across regenerations (e.g. the `app` feature gates)."""
+        m = re.search(r"// @generated-mods-begin.*?// @generated-mods-end", text, flags=re.S)
+        cfgs, pending = {}, []
+        for line in (m.group(0).splitlines() if m else []):
+            if line.startswith("#[cfg"):
+                pending.append(line)
+            elif line.startswith("pub mod "):
+                cfgs[line[len("pub mod "):].rstrip(";")] = pending
+                pending = []
+        return cfgs
+
+    def gen_block(mods, cfgs={}):
         lines = ["// @generated-mods-begin (tools/scaffold.py; do not edit by hand)"]
         for name, rel in sorted(mods):
+            lines.extend(cfgs.get(ident(name), []))
             if rel:
                 lines.append(f'#[path = "{rel}"]')
             lines.append(f"pub mod {ident(name)};")
@@ -157,6 +171,7 @@ def scaffold(tree, rs_tree, root_file, EXCLUDE_DIRS, status):
             text = open(path).read()
             if block:
                 if "// @generated-mods-begin" in text:
+                    block = gen_block(mods, block_cfgs(text))
                     text = re.sub(r"// @generated-mods-begin.*?// @generated-mods-end\n",
                                   lambda _: block, text, flags=re.S)
                     open(path, "w").write(text)

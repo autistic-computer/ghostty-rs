@@ -16,10 +16,11 @@
 //!   files under `/tmp` are always accepted as temporary files).
 
 /// Maximum file name length (`NAME_MAX`). The libc crate doesn't export it
-/// for Apple targets; Darwin's `sys/syslimits.h` defines it as 255.
-#[cfg(not(target_vendor = "apple"))]
+/// for Apple targets or Windows; Darwin's `sys/syslimits.h` defines it as
+/// 255, and so is Windows' file name component limit.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 const NAME_MAX: usize = libc::NAME_MAX as usize;
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", not(unix)))]
 const NAME_MAX: usize = 255;
 
 use std::fmt;
