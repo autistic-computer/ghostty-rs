@@ -61,8 +61,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use indexmap::IndexSet;
-
 use crate::datastruct::intrusive_linked_list::DoublyLinkedList;
 use crate::datastruct::untouched_pool::{self, ResetMode, UntouchedPool};
 use crate::fastmem;
@@ -1011,7 +1009,14 @@ unsafe fn pool_item<'a>(item: PagePoolItemPtr) -> &'a mut [u8] {
 
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
-pub type PinSet = IndexSet<PinPtr>;
+///
+/// Zig uses an array hash map, which only builds a hash index past eight
+/// entries. Nothing here looks a pin up by key except `untrack_pin`, and
+/// every page operation already walks the whole list, so this is a plain
+/// vector in insertion order: no hashing, and one allocation instead of
+/// an entries vector plus a hash table. Removal swaps the last pin into
+/// the hole, as the map's swapRemove does.
+pub type PinSet = Vec<PinPtr>;
 
 /// The pool of memory used for a pagelist. This can be shared between
 /// multiple pagelists but it is not threadsafe.
@@ -1291,7 +1296,7 @@ fn init_tracked_pins(alloc: Allocator, viewport_pin: PinPtr) -> Result<PinSet, A
     alloc.check()?;
     let mut set = PinSet::new();
     set.try_reserve_exact(PIN_PREHEAT).map_err(|_| AllocError::OutOfMemory)?;
-    set.insert(viewport_pin);
+    set.push(viewport_pin);
     Ok(set)
 }
 
@@ -2921,7 +2926,7 @@ impl PageList {
                         np.node = node;
                         np.y -= chunk.start;
                         new_p.as_ptr().write(np);
-                        result.tracked_pins.insert(new_p);
+                        result.tracked_pins.push(new_p);
                         remap.insert(p, new_p);
                     }
                 }
@@ -6082,8 +6087,9 @@ impl PageList {
         // SAFETY: fresh pin pool item.
         unsafe { tracked.as_ptr().write(p) };
 
-        let inserted = self.tracked_pins.insert(tracked);
-        debug_assert!(inserted);
+        // A fresh pool item can't already be tracked.
+        debug_assert!(!self.tracked_pins.contains(&tracked));
+        self.tracked_pins.push(tracked);
 
         Ok(tracked)
     }
@@ -6091,7 +6097,10 @@ impl PageList {
     /// Untrack a previously tracked pin. This will deallocate the pin.
     pub fn untrack_pin(&mut self, p: PinPtr) {
         assert!(p != self.viewport_pin);
-        if self.tracked_pins.swap_remove(&p) {
+        // Search from the end: pins tracked for the length of one
+        // operation are untracked before older ones.
+        if let Some(i) = self.tracked_pins.iter().rposition(|&q| q == p) {
+            self.tracked_pins.swap_remove(i);
             self.pool.pins.destroy(p);
         }
     }
@@ -6102,7 +6111,7 @@ impl PageList {
 
     /// Returns the tracked pins for this pagelist. The slice is owned by the
     /// pagelist and is only valid until the pagelist is modified.
-    pub fn tracked_pins(&self) -> &indexmap::set::Slice<PinPtr> {
+    pub fn tracked_pins(&self) -> &[PinPtr] {
         self.tracked_pins.as_slice()
     }
 
