@@ -910,6 +910,26 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(io_c::Reader, userdata, pointer("opaque", false, true)),
             ],
         ),
+        TypeDecl::init_struct::<render::CopiedCell>("GhosttyRenderStateCell", {
+            use render::CopiedCell as C;
+            vec![
+                field!(C, content, named("u32")),
+                field!(C, style, named("u16")),
+                field!(C, grapheme, named("u16")),
+                field!(C, content_tag, named("u8")),
+                field!(C, wide, named("u8")),
+                field!(C, flags, named("u8")),
+                field!(C, semantic_content, named("u8")),
+            ]
+        }),
+        TypeDecl::init_struct::<render::Clip>(
+            "GhosttyRenderStateClip",
+            vec![
+                field!(render::Clip, y, named("u16")),
+                field!(render::Clip, rows, named("u16")),
+                field!(render::Clip, cols, named("u16")),
+            ],
+        ),
         TypeDecl::init_struct::<render::Colors>("GhosttyRenderStateColors", {
             use render::Colors as C;
             vec![
@@ -935,6 +955,13 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(C, visual_style, named("GhosttyRenderStateCursorVisualStyle")),
             ]
         }),
+        TypeDecl::init_struct::<render::CopiedGrapheme>(
+            "GhosttyRenderStateGrapheme",
+            vec![
+                field!(render::CopiedGrapheme, offset, named("u32")),
+                field!(render::CopiedGrapheme, len, named("u32")),
+            ],
+        ),
         TypeDecl::init_struct::<render::Overscan>(
             "GhosttyRenderStateOverscan",
             vec![
@@ -942,6 +969,25 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(render::Overscan, below, named("u16")),
             ],
         ),
+        TypeDecl::init_struct::<render::RowCellsCopy>("GhosttyRenderStateRowCellsCopy", {
+            use render::RowCellsCopy as C;
+            vec![
+                field!(C, size, named(USIZE)),
+                field!(C, cells, pointer("GhosttyRenderStateCell", false, true)),
+                field!(C, cells_cap, named(USIZE)),
+                field!(C, cells_len, named(USIZE)),
+                field!(C, styles, pointer("GhosttyStyle", false, true)),
+                field!(C, styles_cap, named(USIZE)),
+                field!(C, styles_len, named(USIZE)),
+                field!(C, graphemes, pointer("GhosttyRenderStateGrapheme", false, true)),
+                field!(C, graphemes_cap, named(USIZE)),
+                field!(C, graphemes_len, named(USIZE)),
+                field!(C, grapheme_bytes, pointer("u8", false, true)),
+                field!(C, grapheme_bytes_cap, named(USIZE)),
+                field!(C, grapheme_bytes_len, named(USIZE)),
+                field!(C, flags, named("u32")),
+            ]
+        }),
         TypeDecl::init_struct::<render::RowId>(
             "GhosttyRenderStateRowId",
             vec![field!(render::RowId, bits, array("u64", 2))],
@@ -2259,6 +2305,33 @@ mod tests {
 
         let option_values = obj(&manifest_types["GhosttyRenderStateOption"]["values"]);
         assert_eq!(1, option_values["OVERSCAN"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn manifest_describes_render_state_clip_types() {
+        let parsed = parsed();
+        let manifest_types = obj(&parsed["types"]);
+
+        let clip = obj(&manifest_types["GhosttyRenderStateClip"]);
+        assert_eq!(6, clip["size"].as_i64().unwrap());
+        let clip_fields = obj(&clip["fields"]);
+        assert_eq!(0, clip_fields["y"]["offset"].as_i64().unwrap());
+        assert_eq!(2, clip_fields["rows"]["offset"].as_i64().unwrap());
+        assert_eq!(4, clip_fields["cols"]["offset"].as_i64().unwrap());
+
+        let data_values = obj(&manifest_types["GhosttyRenderStateData"]["values"]);
+        assert_eq!(24, data_values["CLIP"].as_i64().unwrap());
+        assert_eq!(25, data_values["CLIP_REQUEST"].as_i64().unwrap());
+
+        let option_values = obj(&manifest_types["GhosttyRenderStateOption"]["values"]);
+        assert_eq!(2, option_values["CLIP"].as_i64().unwrap());
+
+        let copy = obj(&manifest_types["GhosttyRenderStateRowCellsCopy"]);
+        let copy_fields = obj(&copy["fields"]);
+        assert_eq!(
+            std::mem::offset_of!(crate::terminal::c::render::RowCellsCopy, flags) as i64,
+            copy_fields["flags"]["offset"].as_i64().unwrap()
+        );
     }
 
     #[test]

@@ -19,7 +19,11 @@
 //! - `RenderState::update`/`begin_update` cannot fail in Rust (allocation
 //!   failure aborts), so the `out_of_memory` results are unreachable.
 //! - The sized-struct writers (`writeCursor`/`writeColors`) write through
-//!   raw field pointers since the caller's struct may be truncated.
+//!   raw field pointers since the caller's struct may be truncated, and so
+//!   does `row_cells_copy` for `GhosttyRenderStateRowCellsCopy`. It writes
+//!   the caller's cell, style and grapheme buffers with `ptr::write`.
+//! - `trimmedEnd` ORs each group of eight raw cells with a fold over a
+//!   `[Cell; 8]` instead of `@Vector`/`@reduce`.
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
@@ -54,6 +58,10 @@ pub struct RenderStateWrapper {
     /// between an update and reading that update's rows would point the
     /// reads at the wrong entries.
     overscan_request: renderpkg::Overscan,
+
+    /// The clip request set through the C API, applied like
+    /// `overscan_request` and for the same reason.
+    clip_request: renderpkg::Clip,
 }
 
 impl RenderStateWrapper {
@@ -61,6 +69,7 @@ impl RenderStateWrapper {
     /// the start of every update.
     fn apply_options(&mut self) {
         self.state.overscan_request = self.overscan_request;
+        self.state.clip_request = self.clip_request;
     }
 }
 
@@ -98,7 +107,7 @@ pub struct RowIteratorWrapper {
 
     /// The viewport y of the first row in the slices. This is the
     /// negated count of overscan rows captured above the viewport, or
-    /// zero without overscan.
+    /// zero without overscan, offset by the first row of any clip.
     viewport_y_base: i32,
 
     /// The global dirty state from the render state that populated this
@@ -239,6 +248,33 @@ impl Overscan {
     }
 }
 
+/// C: GhosttyRenderStateClip
+///
+/// This uses `u16` rather than `size.CellCountInt` so that the C layout
+/// stays fixed even if the Zig type changes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Clip {
+    /// The first viewport row.
+    pub y: u16,
+
+    /// The number of rows starting at `y`.
+    pub rows: u16,
+
+    /// The number of columns from the left edge.
+    pub cols: u16,
+}
+
+impl Clip {
+    fn init(v: renderpkg::Clip) -> Clip {
+        Clip {
+            y: v.y,
+            rows: v.rows,
+            cols: v.cols,
+        }
+    }
+}
+
 /// C: GhosttyRenderStateRowId
 ///
 /// Opaque to C, where only equality is documented. The encoding is
@@ -307,7 +343,8 @@ crate::c_api_enum! {
     /// [`CursorVisualStyle`], the other `cursor_*` → `bool`, `cursor` →
     /// [`Cursor`], `colors` → [`Colors`], `overscan`/`overscan_request` →
     /// [`Overscan`], `image_iterator` → [`ImageIterator`],
-    /// `image_placements_generation` → `u64`.
+    /// `image_placements_generation` → `u64`, `clip`/`clip_request` →
+    /// [`Clip`].
     pub enum Data {
         Invalid = 0,
         Cols = 1,
@@ -333,16 +370,20 @@ crate::c_api_enum! {
         OverscanRequest = 21,
         ImageIterator = 22,
         ImagePlacementsGeneration = 23,
+        Clip = 24,
+        ClipRequest = 25,
     }
 }
 
 crate::c_api_enum! {
     /// C: GhosttyRenderStateOption
     ///
-    /// Input types: `dirty` → [`Dirty`], `overscan` → [`Overscan`].
+    /// Input types: `dirty` → [`Dirty`], `overscan` → [`Overscan`],
+    /// `clip` → [`Clip`].
     pub enum SetOption {
         Dirty = 0,
         Overscan = 1,
+        Clip = 2,
     }
 }
 
@@ -382,6 +423,7 @@ fn new_(alloc_: Option<&CAllocator>) -> Option<*mut RenderStateWrapper> {
         alloc,
         state: renderpkg::RenderState::empty(),
         overscan_request: renderpkg::Overscan::default(),
+        clip_request: renderpkg::Clip::default(),
     });
     if ptr.is_null() {
         None
@@ -568,7 +610,7 @@ unsafe fn get_typed(state: &mut RenderStateWrapper, data: Data, out: *mut c_void
                 serials: &row_data.serial[r],
                 state_dirty: &s.dirty,
                 palette: &s.colors.palette,
-                viewport_y_base: -(s.overscan.above as i32),
+                viewport_y_base: s.clip.y as i32 - s.overscan.above as i32,
             };
         }
         Data::ColorBackground => write!(RgbC, s.colors.background.cval()),
@@ -626,6 +668,8 @@ unsafe fn get_typed(state: &mut RenderStateWrapper, data: Data, out: *mut c_void
             };
         }
         Data::ImagePlacementsGeneration => write!(u64, s.image_placements_generation()),
+        Data::Clip => write!(Clip, Clip::init(s.clip)),
+        Data::ClipRequest => write!(Clip, Clip::init(state.clip_request)),
     }
 
     Result::Success
@@ -667,6 +711,14 @@ unsafe fn set_typed(state_: RenderState, option: SetOption, value: *const c_void
             state.overscan_request = renderpkg::Overscan {
                 above: v.above,
                 below: v.below,
+            };
+        }
+        SetOption::Clip => {
+            let v = &*(value as *const Clip);
+            state.clip_request = renderpkg::Clip {
+                y: v.y,
+                rows: v.rows,
+                cols: v.cols,
             };
         }
     }
@@ -1018,6 +1070,257 @@ pub unsafe extern "C" fn row_cells_get_multi(
         *w = count;
     }
     Result::Success
+}
+
+/// C: GhosttyRenderStateCell
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CopiedCell {
+    pub content: u32,
+    pub style: u16,
+    pub grapheme: u16,
+    pub content_tag: u8,
+    pub wide: u8,
+    pub flags: u8,
+    pub semantic_content: u8,
+}
+
+impl CopiedCell {
+    pub const HYPERLINK: u8 = 1 << 0;
+    pub const PROTECTED: u8 = 1 << 1;
+}
+
+/// C: GhosttyRenderStateGrapheme
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CopiedGrapheme {
+    pub offset: u32,
+    pub len: u32,
+}
+
+/// C: GhosttyRenderStateRowCellsCopy
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RowCellsCopy {
+    pub size: usize,
+    pub cells: *mut CopiedCell,
+    pub cells_cap: usize,
+    pub cells_len: usize,
+    pub styles: *mut style_c::Style,
+    pub styles_cap: usize,
+    pub styles_len: usize,
+    pub graphemes: *mut CopiedGrapheme,
+    pub graphemes_cap: usize,
+    pub graphemes_len: usize,
+    pub grapheme_bytes: *mut u8,
+    pub grapheme_bytes_cap: usize,
+    pub grapheme_bytes_len: usize,
+    pub flags: u32,
+}
+
+impl Default for RowCellsCopy {
+    fn default() -> Self {
+        RowCellsCopy {
+            size: size_of::<RowCellsCopy>(),
+            cells: std::ptr::null_mut(),
+            cells_cap: 0,
+            cells_len: 0,
+            styles: std::ptr::null_mut(),
+            styles_cap: 0,
+            styles_len: 0,
+            graphemes: std::ptr::null_mut(),
+            graphemes_cap: 0,
+            graphemes_len: 0,
+            grapheme_bytes: std::ptr::null_mut(),
+            grapheme_bytes_cap: 0,
+            grapheme_bytes_len: 0,
+            flags: 0,
+        }
+    }
+}
+
+impl RowCellsCopy {
+    pub const TRIM: u32 = 1 << 0;
+
+    /// The size of the struct before `flags` was added. Callers built
+    /// against it still copy, without flags.
+    const SIZE_WITHOUT_FLAGS: usize = offset_of!(RowCellsCopy, flags);
+}
+
+/// Slots in the direct-mapped style cache of `row_cells_copy`. A
+/// collision only costs a duplicate style table entry.
+const COPY_STYLE_SLOTS: usize = 256;
+const COPY_STYLE_SLOT_EMPTY: u32 = u32::MAX;
+
+/// C: ghostty_render_state_row_cells_copy
+///
+/// # Safety
+/// `cells_` must be NULL or live; `out_` must be NULL or point to a
+/// sized struct of at least `out_.size` bytes whose buffers hold their
+/// capacities.
+#[export_name = "ghostty_render_state_row_cells_copy"]
+pub unsafe extern "C" fn row_cells_copy(
+    cells_: RowCells,
+    x: CellCountInt,
+    len: CellCountInt,
+    out_: *mut RowCellsCopy,
+) -> Result {
+    use std::ptr::{addr_of, addr_of_mut};
+
+    let Some(cells) = cells_.as_ref() else {
+        return Result::InvalidValue;
+    };
+    if out_.is_null() {
+        return Result::InvalidValue;
+    }
+
+    // The caller's struct may end before `flags`, so its fields are read
+    // and written through raw field pointers.
+    let out_size = addr_of!((*out_).size).read();
+    if out_size < RowCellsCopy::SIZE_WITHOUT_FLAGS {
+        return Result::InvalidValue;
+    }
+    let raws = cells.raws();
+    if x as usize > raws.len() {
+        return Result::InvalidValue;
+    }
+    let flags: u32 = if out_size >= RowCellsCopy::SIZE_WITHOUT_FLAGS + size_of::<u32>() {
+        addr_of!((*out_).flags).read()
+    } else {
+        0
+    };
+    let out_cells = addr_of!((*out_).cells).read();
+    let cells_cap = addr_of!((*out_).cells_cap).read();
+    let out_styles = addr_of!((*out_).styles).read();
+    let styles_cap = addr_of!((*out_).styles_cap).read();
+    let out_graphemes = addr_of!((*out_).graphemes).read();
+    let graphemes_cap = addr_of!((*out_).graphemes_cap).read();
+    let out_bytes = addr_of!((*out_).grapheme_bytes).read();
+    let bytes_cap = addr_of!((*out_).grapheme_bytes_cap).read();
+
+    let start: usize = x as usize;
+    let end: usize = if flags & RowCellsCopy::TRIM != 0 {
+        trimmed_end(raws, start, (start + len as usize).min(raws.len()))
+    } else {
+        (start + len as usize).min(raws.len())
+    };
+
+    let mut styles_len: usize = 1;
+    if styles_cap >= 1 && !out_styles.is_null() {
+        out_styles.write(style_c::Style::DEFAULT);
+    }
+    let mut graphemes_len: usize = 0;
+    let mut bytes_len: usize = 0;
+    let mut slots = [COPY_STYLE_SLOT_EMPTY; COPY_STYLE_SLOTS];
+    let mut previous_x: usize = POSITION_NONE;
+    let mut previous_style: u16 = 0;
+
+    for (i, cx) in (start..end).enumerate() {
+        // A non-empty range means the wrapper was populated.
+        let row: &renderpkg::Cells = cells.cells();
+        let cell = raws[cx];
+
+        let mut style_index: u16 = 0;
+        if cell.has_styling() {
+            let s = &row.style[cx];
+            if previous_x != POSITION_NONE && row.style[previous_x].eql(s) {
+                style_index = previous_style;
+            } else {
+                let slot = &mut slots[(s.hash() as usize) % COPY_STYLE_SLOTS];
+                if *slot != COPY_STYLE_SLOT_EMPTY && row.style[(*slot >> 16) as usize].eql(s) {
+                    style_index = *slot as u16;
+                } else {
+                    style_index = styles_len as u16;
+                    if styles_len < styles_cap && !out_styles.is_null() {
+                        out_styles.add(styles_len).write(style_c::Style::from_style(s));
+                    }
+                    styles_len += 1;
+                    *slot = ((cx as u32) << 16) | style_index as u32;
+                }
+            }
+            previous_x = cx;
+            previous_style = style_index;
+        }
+
+        let mut grapheme: u16 = 0;
+        if cell.has_grapheme() && cell.has_text() {
+            let fits = bytes_len < bytes_cap && !out_bytes.is_null();
+            let mut buffer = Buffer {
+                ptr: if fits { out_bytes.add(bytes_len) } else { std::ptr::null_mut() },
+                cap: if fits { bytes_cap - bytes_len } else { 0 },
+                len: 0,
+            };
+            match row_cells_get_graphemes_utf8(cell, row.grapheme(cx), &mut buffer) {
+                Result::Success | Result::OutOfSpace => {}
+                result => return result,
+            }
+            if graphemes_len < graphemes_cap && bytes_len + buffer.len <= bytes_cap && !out_graphemes.is_null() {
+                out_graphemes.add(graphemes_len).write(CopiedGrapheme {
+                    offset: bytes_len as u32,
+                    len: buffer.len as u32,
+                });
+            }
+            graphemes_len += 1;
+            bytes_len += buffer.len;
+            grapheme = graphemes_len as u16;
+        }
+
+        if i < cells_cap && !out_cells.is_null() {
+            out_cells.add(i).write(CopiedCell {
+                content: match cell.content_tag() {
+                    ContentTag::Codepoint | ContentTag::CodepointGrapheme => cell.content_codepoint(),
+                    ContentTag::BgColorPalette => cell.content_color_palette() as u32,
+                    ContentTag::BgColorRgb => {
+                        let rgb = cell.content_color_rgb();
+                        ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | rgb.b as u32
+                    }
+                },
+                style: style_index,
+                grapheme,
+                content_tag: cell.content_tag() as u8,
+                wide: cell.wide() as u8,
+                flags: (if cell.hyperlink() { CopiedCell::HYPERLINK } else { 0 })
+                    | (if cell.protected() { CopiedCell::PROTECTED } else { 0 }),
+                semantic_content: cell.semantic_content() as u8,
+            });
+        }
+    }
+
+    let cells_len = end - start;
+    addr_of_mut!((*out_).cells_len).write(cells_len);
+    addr_of_mut!((*out_).styles_len).write(styles_len);
+    addr_of_mut!((*out_).graphemes_len).write(graphemes_len);
+    addr_of_mut!((*out_).grapheme_bytes_len).write(bytes_len);
+    if (cells_len > 0 && out_cells.is_null())
+        || cells_len > cells_cap
+        || out_styles.is_null()
+        || styles_len > styles_cap
+        || (graphemes_len > 0 && out_graphemes.is_null())
+        || graphemes_len > graphemes_cap
+        || (bytes_len > 0 && out_bytes.is_null())
+        || bytes_len > bytes_cap
+    {
+        return Result::OutOfSpace;
+    }
+    Result::Success
+}
+
+/// Returns the end of `raws[start..end]` without its trailing default
+/// cells, the all-zero cells an erased or never written column holds.
+fn trimmed_end(raws: &[page::Cell], start: usize, end: usize) -> usize {
+    const GROUP: usize = 8;
+    let mut i = end;
+    while i - start >= GROUP {
+        let group: &[page::Cell; GROUP] = raws[i - GROUP..i].try_into().unwrap();
+        if group.iter().fold(0u64, |acc, c| acc | c.to_bits()) != 0 {
+            break;
+        }
+        i -= GROUP;
+    }
+    while i > start && raws[i - 1].is_zero() {
+        i -= 1;
+    }
+    i
 }
 
 #[inline]
@@ -2293,6 +2596,363 @@ mod tests {
             };
             assert_eq!(Result::Success, cells_get_(cells, RowCellsData::GraphemesUtf8, &mut text));
             assert_eq!(0, text.len);
+            free_all(terminal, state, it, cells);
+        }
+    }
+
+    fn expect_copied_style(expected: &style_c::Style, actual: &style_c::Style) {
+        let colors = [
+            (expected.fg_color, actual.fg_color),
+            (expected.bg_color, actual.bg_color),
+            (expected.underline_color, actual.underline_color),
+        ];
+        for (e, a) in colors {
+            assert_eq!(e.tag, a.tag);
+            // SAFETY: every arm of the union is plain data.
+            assert_eq!(unsafe { e.value._padding }, unsafe { a.value._padding });
+        }
+        assert_eq!(expected.bold, actual.bold);
+        assert_eq!(expected.italic, actual.italic);
+        assert_eq!(expected.faint, actual.faint);
+        assert_eq!(expected.blink, actual.blink);
+        assert_eq!(expected.inverse, actual.inverse);
+        assert_eq!(expected.invisible, actual.invisible);
+        assert_eq!(expected.strikethrough, actual.strikethrough);
+        assert_eq!(expected.overline, actual.overline);
+        assert_eq!(expected.underline, actual.underline);
+    }
+
+    #[test]
+    fn render_row_cells_copy_matches_the_per_cell_getters() {
+        let terminal = new_terminal(12, 4);
+        write(
+            terminal,
+            "\x1b[1;31mab\x1b[0mc\x1b[1;31md\x1b[0me\u{301}\u{4E2D}\
+             \x1b]8;;http://x\x1b\\L\x1b]8;;\x1b\\\x1b[4;38;2;1;2;3mu\x1b[0m\
+             \r\n\x1b[48;5;4m\x1b[K\x1b[0m\r\n\x1b[48;2;7;8;9m\x1b[K\x1b[0mz"
+                .as_bytes(),
+        );
+
+        let state = new_state();
+        unsafe {
+            assert_eq!(Result::Success, update(state, terminal));
+
+            let it = row_iter(state);
+            let mut cells = new_row_cells();
+
+            let mut copied = [CopiedCell::default(); 12];
+            let mut styles = [style_c::Style::DEFAULT; 13];
+            let mut graphemes = [CopiedGrapheme::default(); 12];
+            let mut bytes = [0u8; 96];
+            let mut rows: usize = 0;
+            while row_iterator_next(it) {
+                assert_eq!(Result::Success, row_get_(it, RowData::Cells, &mut cells));
+                let mut out = RowCellsCopy {
+                    cells: copied.as_mut_ptr(),
+                    cells_cap: copied.len(),
+                    styles: styles.as_mut_ptr(),
+                    styles_cap: styles.len(),
+                    graphemes: graphemes.as_mut_ptr(),
+                    graphemes_cap: graphemes.len(),
+                    grapheme_bytes: bytes.as_mut_ptr(),
+                    grapheme_bytes_cap: bytes.len(),
+                    ..Default::default()
+                };
+                assert_eq!(Result::Success, row_cells_copy(cells, 0, 12, &mut out));
+                assert_eq!(12, out.cells_len);
+                expect_copied_style(&style_c::Style::DEFAULT, &styles[0]);
+                if rows == 0 {
+                    assert_eq!(3, out.styles_len);
+                    assert_eq!(copied[0].style, copied[3].style);
+                    assert_eq!(1, out.graphemes_len);
+                    assert!(copied[7].flags & CopiedCell::HYPERLINK != 0);
+                }
+
+                for (x, cell) in copied.iter().enumerate() {
+                    assert_eq!(Result::Success, row_cells_select(cells, x as CellCountInt));
+                    let mut raw_value: cell_c::CCell = 0;
+                    assert_eq!(Result::Success, cells_get_(cells, RowCellsData::Raw, &mut raw_value));
+                    let raw = page::Cell::from_bits(raw_value);
+                    assert_eq!(raw.content_tag() as u8, cell.content_tag);
+                    assert_eq!(raw.wide() as u8, cell.wide);
+                    assert_eq!(raw.hyperlink(), cell.flags & CopiedCell::HYPERLINK != 0);
+                    assert_eq!(raw.semantic_content() as u8, cell.semantic_content);
+
+                    let mut expected_style = style_c::Style::DEFAULT;
+                    assert_eq!(Result::Success, cells_get_(cells, RowCellsData::Style, &mut expected_style));
+                    assert!((cell.style as usize) < out.styles_len);
+                    expect_copied_style(&expected_style, &styles[cell.style as usize]);
+
+                    let mut text_buf = [0u8; 32];
+                    let mut text = Buffer {
+                        ptr: text_buf.as_mut_ptr(),
+                        cap: text_buf.len(),
+                        len: 0,
+                    };
+                    assert_eq!(Result::Success, cells_get_(cells, RowCellsData::GraphemesUtf8, &mut text));
+                    if cell.grapheme != 0 {
+                        let span = graphemes[cell.grapheme as usize - 1];
+                        let offset = span.offset as usize;
+                        assert_eq!(&text_buf[..text.len], &bytes[offset..offset + span.len as usize]);
+                    } else if text.len > 0 {
+                        let mut encoded = [0u8; 4];
+                        let n = char::from_u32(cell.content).unwrap().encode_utf8(&mut encoded).len();
+                        assert_eq!(&text_buf[..text.len], &encoded[..n]);
+                    }
+
+                    let mut bg = RgbC { r: 0, g: 0, b: 0 };
+                    let bg_result = cells_get_(cells, RowCellsData::BgColor, &mut bg);
+                    match raw.content_tag() {
+                        ContentTag::BgColorPalette => {
+                            assert_eq!(Result::Success, bg_result);
+                            assert_eq!(4, cell.content);
+                        }
+                        ContentTag::BgColorRgb => {
+                            assert_eq!(Result::Success, bg_result);
+                            assert_eq!(((bg.r as u32) << 16) | ((bg.g as u32) << 8) | bg.b as u32, cell.content);
+                        }
+                        ContentTag::Codepoint | ContentTag::CodepointGrapheme => {
+                            assert_eq!(raw.codepoint(), cell.content);
+                        }
+                    }
+                }
+                rows += 1;
+            }
+            assert_eq!(4, rows);
+            free_all(terminal, state, it, cells);
+        }
+    }
+
+    #[test]
+    fn render_row_cells_copy_reports_short_buffers_and_ranges() {
+        let terminal = new_terminal(8, 2);
+        write(terminal, "\x1b[1ma\x1b[3mb\x1b[0mce\u{301}".as_bytes());
+
+        let state = new_state();
+        unsafe {
+            assert_eq!(Result::Success, update(state, terminal));
+            let it = row_iter(state);
+            let mut cells = new_row_cells();
+            assert!(row_iterator_next(it));
+            assert_eq!(Result::Success, row_get_(it, RowData::Cells, &mut cells));
+
+            let mut query = RowCellsCopy::default();
+            assert_eq!(Result::OutOfSpace, row_cells_copy(cells, 0, 8, &mut query));
+            assert_eq!(8, query.cells_len);
+            assert_eq!(3, query.styles_len);
+            assert_eq!(1, query.graphemes_len);
+            assert_eq!(3, query.grapheme_bytes_len);
+
+            let mut copied = [CopiedCell::default(); 8];
+            let mut styles = [style_c::Style::DEFAULT; 3];
+            let mut graphemes = [CopiedGrapheme::default(); 1];
+            let mut bytes = [0u8; 2];
+            let mut short = RowCellsCopy {
+                cells: copied.as_mut_ptr(),
+                cells_cap: copied.len(),
+                styles: styles.as_mut_ptr(),
+                styles_cap: styles.len(),
+                graphemes: graphemes.as_mut_ptr(),
+                graphemes_cap: graphemes.len(),
+                grapheme_bytes: bytes.as_mut_ptr(),
+                grapheme_bytes_cap: bytes.len(),
+                ..Default::default()
+            };
+            assert_eq!(Result::OutOfSpace, row_cells_copy(cells, 0, 8, &mut short));
+            assert_eq!(3, short.grapheme_bytes_len);
+
+            let mut tail = RowCellsCopy {
+                cells: copied.as_mut_ptr(),
+                cells_cap: copied.len(),
+                styles: styles.as_mut_ptr(),
+                styles_cap: styles.len(),
+                ..Default::default()
+            };
+            assert_eq!(Result::Success, row_cells_copy(cells, 1, 2, &mut tail));
+            assert_eq!(2, tail.cells_len);
+            assert_eq!(2, tail.styles_len);
+            assert_eq!('b' as u32, copied[0].content);
+            assert_eq!(1, copied[0].style);
+            assert_eq!(0, copied[1].style);
+
+            assert_eq!(Result::Success, row_cells_copy(cells, 6, 100, &mut tail));
+            assert_eq!(2, tail.cells_len);
+            assert_eq!(Result::Success, row_cells_copy(cells, 8, 1, &mut tail));
+            assert_eq!(0, tail.cells_len);
+            assert_eq!(Result::InvalidValue, row_cells_copy(cells, 9, 1, &mut tail));
+            assert_eq!(Result::InvalidValue, row_cells_copy(std::ptr::null_mut(), 0, 1, &mut tail));
+            assert_eq!(Result::InvalidValue, row_cells_copy(cells, 0, 1, std::ptr::null_mut()));
+            free_all(terminal, state, it, cells);
+        }
+    }
+
+    #[test]
+    fn render_row_cells_copy_trims_trailing_default_cells() {
+        let terminal = new_terminal(20, 4);
+        write(terminal, "ab\x1b[5Gc\r\n\x1b[48;5;4m\x1b[K\x1b[0m\r\n\r\n\u{4E2D}".as_bytes());
+
+        let state = new_state();
+        unsafe {
+            assert_eq!(Result::Success, update(state, terminal));
+            let mut it = row_iter(state);
+            let mut cells = new_row_cells();
+
+            let mut full = [CopiedCell::default(); 20];
+            let mut trimmed = [CopiedCell::default(); 20];
+            let mut styles = [style_c::Style::DEFAULT; 21];
+            let expected: [usize; 4] = [5, 20, 0, 2];
+            let mut y: usize = 0;
+            while row_iterator_next(it) {
+                assert_eq!(Result::Success, row_get_(it, RowData::Cells, &mut cells));
+                let mut all = RowCellsCopy {
+                    cells: full.as_mut_ptr(),
+                    cells_cap: full.len(),
+                    styles: styles.as_mut_ptr(),
+                    styles_cap: styles.len(),
+                    ..Default::default()
+                };
+                assert_eq!(Result::Success, row_cells_copy(cells, 0, 20, &mut all));
+                assert_eq!(20, all.cells_len);
+
+                let mut trim = RowCellsCopy {
+                    cells: trimmed.as_mut_ptr(),
+                    cells_cap: trimmed.len(),
+                    styles: styles.as_mut_ptr(),
+                    styles_cap: styles.len(),
+                    flags: RowCellsCopy::TRIM,
+                    ..Default::default()
+                };
+                assert_eq!(Result::Success, row_cells_copy(cells, 0, 20, &mut trim));
+                assert_eq!(expected[y], trim.cells_len);
+                for (a, b) in full[..trim.cells_len].iter().zip(trimmed[..trim.cells_len].iter()) {
+                    assert_eq!(a, b);
+                }
+                for cell in &full[trim.cells_len..] {
+                    assert_eq!(CopiedCell::default(), *cell);
+                }
+                y += 1;
+            }
+            assert_eq!(4, y);
+
+            assert_eq!(Result::Success, get_(state, Data::RowIterator, &mut it));
+            assert!(row_iterator_next(it));
+            assert_eq!(Result::Success, row_get_(it, RowData::Cells, &mut cells));
+            let mut range = RowCellsCopy {
+                cells: trimmed.as_mut_ptr(),
+                cells_cap: trimmed.len(),
+                styles: styles.as_mut_ptr(),
+                styles_cap: styles.len(),
+                flags: RowCellsCopy::TRIM,
+                ..Default::default()
+            };
+            assert_eq!(Result::Success, row_cells_copy(cells, 3, 10, &mut range));
+            assert_eq!(2, range.cells_len);
+            assert_eq!('c' as u32, trimmed[1].content);
+            assert_eq!(Result::Success, row_cells_copy(cells, 5, 10, &mut range));
+            assert_eq!(0, range.cells_len);
+
+            let mut old = RowCellsCopy {
+                size: offset_of!(RowCellsCopy, flags),
+                cells: trimmed.as_mut_ptr(),
+                cells_cap: trimmed.len(),
+                styles: styles.as_mut_ptr(),
+                styles_cap: styles.len(),
+                flags: RowCellsCopy::TRIM,
+                ..Default::default()
+            };
+            assert_eq!(Result::Success, row_cells_copy(cells, 0, 20, &mut old));
+            assert_eq!(20, old.cells_len);
+            old.size -= 1;
+            assert_eq!(Result::InvalidValue, row_cells_copy(cells, 0, 20, &mut old));
+            free_all(terminal, state, it, cells);
+        }
+    }
+
+    #[test]
+    fn render_clip_limits_rows_columns_and_the_cursor() {
+        let terminal = new_terminal(10, 6);
+        write(terminal, b"r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5");
+
+        let state = new_state();
+        unsafe {
+            let mut out = Clip::default();
+            assert_eq!(Result::Success, get_(state, Data::ClipRequest, &mut out));
+            assert_eq!(Clip::default(), out);
+            assert_eq!(Result::Success, update(state, terminal));
+            assert_eq!(Result::Success, get_(state, Data::Clip, &mut out));
+            assert_eq!(Clip { y: 0, rows: 6, cols: 10 }, out);
+
+            let req = Clip { y: 2, rows: 3, cols: 4 };
+            assert_eq!(Result::Success, set_(state, SetOption::Clip, &req));
+            assert_eq!(Result::Success, get_(state, Data::ClipRequest, &mut out));
+            assert_eq!(req, out);
+
+            // The request applies on the next update.
+            assert_eq!(Result::Success, get_(state, Data::Clip, &mut out));
+            assert_eq!(Clip { y: 0, rows: 6, cols: 10 }, out);
+            assert_eq!(Result::Success, update(state, terminal));
+            assert_eq!(Result::Success, get_(state, Data::Clip, &mut out));
+            assert_eq!(req, out);
+
+            let mut rows: CellCountInt = 0;
+            let mut cols: CellCountInt = 0;
+            assert_eq!(Result::Success, get_(state, Data::Rows, &mut rows));
+            assert_eq!(Result::Success, get_(state, Data::Cols, &mut cols));
+            assert_eq!(6, rows);
+            assert_eq!(10, cols);
+
+            // The cursor is on row 5, below the clip.
+            let mut has_cursor = true;
+            assert_eq!(Result::Success, get_(state, Data::CursorViewportHasValue, &mut has_cursor));
+            assert!(!has_cursor);
+
+            let it = row_iter(state);
+            let mut cells = new_row_cells();
+
+            let mut copied = [CopiedCell::default(); 10];
+            let mut styles = [style_c::Style::DEFAULT; 11];
+            let mut n: usize = 0;
+            while row_iterator_next(it) {
+                let mut vy: i32 = 0;
+                assert_eq!(Result::Success, row_get_(it, RowData::ViewportY, &mut vy));
+                assert_eq!((n + 2) as i32, vy);
+
+                let mut view = cell_c::CellsView {
+                    ptr: std::ptr::null(),
+                    len: 0,
+                };
+                assert_eq!(Result::Success, row_get_(it, RowData::CellsRaw, &mut view));
+                assert_eq!(4, view.len);
+
+                assert_eq!(Result::Success, row_get_(it, RowData::Cells, &mut cells));
+                let mut copy = RowCellsCopy {
+                    cells: copied.as_mut_ptr(),
+                    cells_cap: copied.len(),
+                    styles: styles.as_mut_ptr(),
+                    styles_cap: styles.len(),
+                    ..Default::default()
+                };
+                assert_eq!(Result::Success, row_cells_copy(cells, 0, 10, &mut copy));
+                assert_eq!(4, copy.cells_len);
+                assert_eq!('r' as u32, copied[0].content);
+                assert_eq!('0' as u32 + (n + 2) as u32, copied[1].content);
+                assert_eq!(Result::InvalidValue, row_cells_select(cells, 4));
+                n += 1;
+            }
+            assert_eq!(3, n);
+
+            // A clip that holds the cursor reports it in viewport coordinates.
+            let bottom = Clip { y: 4, rows: 0, cols: 0 };
+            assert_eq!(Result::Success, set_(state, SetOption::Clip, &bottom));
+            assert_eq!(Result::Success, update(state, terminal));
+            assert_eq!(Result::Success, get_(state, Data::Clip, &mut out));
+            assert_eq!(Clip { y: 4, rows: 2, cols: 10 }, out);
+            let mut cursor_y: CellCountInt = 0;
+            assert_eq!(Result::Success, get_(state, Data::CursorViewportY, &mut cursor_y));
+            assert_eq!(5, cursor_y);
+
+            assert_eq!(Result::InvalidValue, set(state, SetOption::Clip as c_int, std::ptr::null()));
+            assert_eq!(Result::InvalidValue, get(state, Data::Clip as c_int, std::ptr::null_mut()));
             free_all(terminal, state, it, cells);
         }
     }

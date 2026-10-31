@@ -141,6 +141,7 @@ pub use self::render::image_iterator_free as render_state_image_iterator_free;
 pub use self::render::image_iterator_new as render_state_image_iterator_new;
 pub use self::render::image_iterator_next as render_state_image_iterator_next;
 pub use self::render::new as render_state_new;
+pub use self::render::row_cells_copy as render_state_row_cells_copy;
 pub use self::render::row_cells_free as render_state_row_cells_free;
 pub use self::render::row_cells_get as render_state_row_cells_get;
 pub use self::render::row_cells_get_multi as render_state_row_cells_get_multi;

@@ -145,6 +145,29 @@ const LOG_TARGET: &str = "render_state";
 /// With no overscan requested (the default), `row_data` holds exactly
 /// the viewport and indices are viewport y values, as before.
 ///
+/// ## Clip
+///
+/// A caller that only draws part of a very large viewport can set
+/// `clip_request` to capture a range of viewport rows and the leftmost
+/// columns of each row. Rows and columns outside the clip are not copied,
+/// so the cost of an update follows the clip rather than the viewport:
+///
+/// ```text
+/// state.clip_request = Clip { y: 10, rows: 40, cols: 120 };
+/// state.update(&mut terminal);
+/// ```
+///
+/// The clipped rows take the place of the viewport rows in `row_data`,
+/// starting at `viewport_start()`, and overscan rows are captured around
+/// them. Each captured row holds `clip.cols` cells. Coordinates keep
+/// their viewport meaning: `viewport_y` maps a captured row back to its
+/// viewport y, and `rows` and `cols` still describe the whole viewport.
+/// `clip` reports what the last update captured, which is the request
+/// limited to the viewport. A clip always captures at least one row and
+/// one column, and the default clip captures the whole viewport.
+/// Image placements are found from the captured rows too, so images that
+/// touch no clipped or overscan row are left out of the list.
+///
 /// ## Images
 ///
 /// The render state also gives the images to draw, as a list of image
@@ -388,10 +411,24 @@ pub struct RenderState {
     ///   - `above` is less near the top of the scrollback.
     ///   - `below` is less when the viewport is close to the bottom of
     ///     the screen, and is zero when the viewport follows the active
-    ///     area.
+    ///     area (unless a clip ends above the bottom of the viewport).
     ///
     /// This is set by the update and should not be modified.
     pub overscan: Overscan,
+
+    /// The part of the viewport to capture. The default captures the
+    /// whole viewport. See "Clip" in the `RenderState` docs.
+    ///
+    /// Like `overscan_request`, only change this immediately before an
+    /// update. Changing it causes the next update to be a full redraw.
+    pub clip_request: Clip,
+
+    /// The part of the viewport that the last update captured. This is
+    /// `clip_request` limited to the viewport, with zero counts replaced
+    /// by the rows and columns they stand for.
+    ///
+    /// This is set by the update and should not be modified.
+    pub clip: Clip,
 
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
@@ -500,6 +537,40 @@ impl Overscan {
     }
 }
 
+/// A part of the viewport: a range of rows and the leftmost columns
+/// of each. Used both to request a clip (`clip_request`) and to report
+/// what was captured (`clip`). (Zig: `RenderState.Clip`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Clip {
+    /// The first viewport row.
+    pub y: CellCountInt,
+
+    /// The number of rows starting at `y`. In a request, zero means
+    /// every row from `y` to the bottom of the viewport.
+    pub rows: CellCountInt,
+
+    /// The number of columns from the left edge. In a request, zero
+    /// means every column.
+    pub cols: CellCountInt,
+}
+
+impl Clip {
+    pub fn eql(self, b: Clip) -> bool {
+        self.y == b.y && self.rows == b.rows && self.cols == b.cols
+    }
+
+    /// Limit a request to a viewport of the given size.
+    pub fn limit(self, rows: CellCountInt, cols: CellCountInt) -> Clip {
+        let y = self.y.min(rows.saturating_sub(1));
+        let max_rows = rows - y;
+        Clip {
+            y,
+            rows: if self.rows == 0 { max_rows } else { self.rows.min(max_rows) },
+            cols: if self.cols == 0 { cols } else { self.cols.min(cols) },
+        }
+    }
+}
+
 /// The captured rows (Zig: `std.MultiArrayList(RenderState.Row)`). Each
 /// field of `RenderState.Row` is one `Vec` here, indexed by the
 /// `row_data` index. Use [`RowData::get`] for a [`Row`] view of one entry.
@@ -518,7 +589,8 @@ pub struct RowData {
     /// Raw row data.
     pub raw: Vec<page::Row>,
 
-    /// The cells in this row. Guaranteed to be `cols` length.
+    /// The cells in this row. Guaranteed to be `clip.cols` length,
+    /// which is `cols` without a clip.
     ///
     /// The cell storage uses the general allocator (NOT a per-row
     /// arena). We do this on purpose because as rows become dirty, we
@@ -1268,6 +1340,8 @@ impl RenderState {
             viewport_pin: None,
             overscan_request: Overscan::default(),
             overscan: Overscan::default(),
+            clip_request: Clip::default(),
+            clip: Clip::default(),
             selection_cache: None,
             pending_styles: Vec::new(),
             kitty: KittyData::default(),
@@ -1356,35 +1430,45 @@ impl RenderState {
         let s: &mut Screen = &mut screen_ptr;
         let viewport_pin = s.pages.get_top_left(point::Tag::Viewport);
 
-        // The overscan rows to capture beyond the viewport. The request
-        // decides the layout of row_data, and the actual counts are
-        // limited to the rows that exist. With no request, everything
-        // below behaves exactly as it does without overscan.
+        // The part of the viewport to capture. Without a clip request
+        // this is the whole viewport and clip_pin is the viewport pin.
+        let clip = self.clip_request.limit(s.pages.rows, s.pages.cols);
+        let clip_pin = if clip.y == 0 {
+            viewport_pin
+        } else {
+            viewport_pin.down(clip.y as usize).unwrap()
+        };
+
+        // The overscan rows to capture beyond the clipped viewport rows.
+        // The request decides the layout of row_data, and the actual
+        // counts are limited to the rows that exist. With no request,
+        // everything below behaves exactly as it does without overscan.
         let above_req: usize = self.overscan_request.above as usize;
         let below_req: usize = self.overscan_request.below as usize;
-        let row_data_len: usize = above_req + s.pages.rows as usize + below_req;
+        let row_data_len: usize = above_req + clip.rows as usize + below_req;
 
-        // The first captured row and how many rows above the viewport
+        // The first captured row and how many rows above the clip
         // we actually got.
         let (top_pin, top_above): (Pin, usize) = if above_req == 0 {
-            (viewport_pin, 0)
+            (clip_pin, 0)
         } else {
-            match viewport_pin.up_overflow(above_req) {
+            match clip_pin.up_overflow(above_req) {
                 PinOverflow::Offset(p) => (p, above_req),
                 PinOverflow::Overflow { end, remaining } => (end, above_req - remaining),
             }
         };
 
-        // How many rows below the viewport we actually get. The page list
+        // How many rows below the clip we actually get. The page list
         // ends at the last active row, so this is zero whenever the
-        // viewport follows the active area. This is computed before the
-        // loop below so that a change can force a redraw. When new output
-        // appears below a scrolled viewport, it can land in an entry that
-        // was never built or that held a different row.
+        // viewport follows the active area and the clip reaches its
+        // bottom. This is computed before the loop below so that a change
+        // can force a redraw. When new output appears below a scrolled
+        // viewport, it can land in an entry that was never built or that
+        // held a different row.
         let below: usize = if below_req == 0 {
             0
         } else {
-            let bottom = viewport_pin.down(s.pages.rows as usize - 1).unwrap();
+            let bottom = clip_pin.down(clip.rows as usize - 1).unwrap();
             match bottom.down_overflow(below_req) {
                 PinOverflow::Offset(_) => below_req,
                 PinOverflow::Overflow { remaining, .. } => below_req - remaining,
@@ -1431,6 +1515,12 @@ impl RenderState {
                 break 'redraw true;
             }
 
+            // If the clip changed, rows and columns may have entered
+            // row_data that were never built.
+            if !self.clip.eql(clip) {
+                break 'redraw true;
+            }
+
             // If our viewport pin changed, we do a full rebuild.
             if let Some(old) = &self.viewport_pin {
                 if !old.eql(viewport_pin) {
@@ -1444,6 +1534,7 @@ impl RenderState {
         // Always set our cheap fields, its more expensive to compare
         self.rows = s.pages.rows;
         self.cols = s.pages.cols;
+        self.clip = clip;
         self.viewport_pin = Some(viewport_pin);
         self.cursor.active = point::Coordinate {
             x: s.cursor.x,
@@ -1506,7 +1597,7 @@ impl RenderState {
 
         // The viewport start, read before the row data is borrowed below.
         let vp_start = self.viewport_start();
-        let rows = self.rows as usize;
+        let clip_rows = clip.rows as usize;
         let cursor_pin: Pin = {
             // SAFETY: the cursor pin is tracked and live.
             unsafe { *s.cursor.page_pin.as_ptr() }
@@ -1523,7 +1614,7 @@ impl RenderState {
         // makes the common case of a clean (or mostly clean) frame very
         // cheap: a contiguous scan of row dirty flags.
         let mut builder = RowBuilder {
-            cols: self.cols as usize,
+            cols: clip.cols as usize,
             raws: &mut row_data.raw,
             cells: &mut row_data.cells,
             sels: &mut row_data.selection,
@@ -1534,7 +1625,7 @@ impl RenderState {
             pending_styles: &mut self.pending_styles,
             applied_styles: &mut row_data.applied_styles,
         };
-        let row_data_end: usize = first + top_above + rows + below;
+        let row_data_end: usize = first + top_above + clip_rows + below;
         let mut y: usize = first;
         let mut any_dirty = false;
         let mut page_it = top_pin.page_iterator(Direction::RightDown, None);
@@ -1564,13 +1655,17 @@ impl RenderState {
                     }
 
                     // The cursor may be in an overscan row, in which case it
-                    // is not visible in the viewport.
+                    // is not visible in the viewport. It may also be outside
+                    // the clip, which captured none of its cells.
                     let idx = y + (cy - cs);
-                    if idx < vp_start || idx >= vp_start + rows {
+                    if idx < vp_start || idx >= vp_start + clip_rows {
+                        break 'cursor;
+                    }
+                    if s.cursor.x >= clip.cols {
                         break 'cursor;
                     }
                     self.cursor.viewport = Some(CursorViewport {
-                        y: (idx - vp_start) as CellCountInt,
+                        y: (idx - vp_start + clip.y as usize) as CellCountInt,
                         x: s.cursor.x,
 
                         // Future: we should use our own state here to look this
@@ -1901,11 +1996,13 @@ impl RenderState {
         self.row_data.dirty.fill(false);
     }
 
-    /// Returns the `row_data` index of the top row of the viewport.
+    /// Returns the `row_data` index of the top row of the viewport, or of
+    /// the top row of the clip when one is set.
     ///
     /// This is `overscan_request.above`, so it is zero without overscan
-    /// and does not change from one update to the next. The viewport is
-    /// the `rows` entries starting here.
+    /// and does not change from one update to the next. The captured
+    /// viewport rows are the `clip.rows` entries starting here, which are
+    /// all `rows` of the viewport without a clip.
     pub fn viewport_start(&self) -> usize {
         self.overscan_request.above as usize
     }
@@ -1913,23 +2010,24 @@ impl RenderState {
     /// Converts a `row_data` index into a y position relative to the top
     /// of the viewport. Rows above the viewport are negative, and rows
     /// below it are `rows` or greater. For example, with one row of
-    /// overscan above, index 0 is y = -1 and index 1 is y = 0.
+    /// overscan above, index 0 is y = -1 and index 1 is y = 0. With a
+    /// clip, `viewport_start()` maps to `clip.y`.
     pub fn viewport_y(&self, index: usize) -> isize {
-        index as isize - self.viewport_start() as isize
+        index as isize - self.viewport_start() as isize + self.clip.y as isize
     }
 
     /// Returns the range of `row_data` that holds rows from the last
-    /// update: the captured overscan rows above, the viewport, and the
-    /// captured overscan rows below.
+    /// update: the captured overscan rows above, the viewport (or its
+    /// clipped rows), and the captured overscan rows below.
     ///
     /// Entries outside this range are unused. They contain leftover or
-    /// uninitialized data and must not be read. Without overscan, this
-    /// is always `0..rows`.
+    /// uninitialized data and must not be read. Without overscan or a
+    /// clip, this is always `0..rows`.
     pub fn row_data_range(&self) -> RowDataRange {
         let vp = self.viewport_start();
         RowDataRange {
             start: vp - self.overscan.above as usize,
-            end: vp + self.rows as usize + self.overscan.below as usize,
+            end: vp + self.clip.rows as usize + self.overscan.below as usize,
         }
     }
 
@@ -2015,8 +2113,9 @@ impl RenderState {
     /// blank lines. This is fine for our current usage (link search) but
     /// we can adjust this later.
     ///
-    /// Only viewport rows are included, never overscan rows. The `y`
-    /// values in `map` are viewport rows.
+    /// Only viewport rows are included, never overscan rows, and only the
+    /// clipped part of them when a clip is set. The `y` values in `map`
+    /// are viewport rows.
     ///
     /// NOTE: There is a limitation in that wrapped lines before/after
     /// the top/bottom line of the viewport are not included, since
@@ -2036,11 +2135,11 @@ impl RenderState {
 
         // This only covers the viewport, never overscan rows.
         let vp_start = self.viewport_start();
-        let rows = self.rows as usize;
+        let rows = self.clip.rows as usize;
         let row_rows = &self.row_data.raw[vp_start..vp_start + rows];
         let row_cells = &self.row_data.cells[vp_start..vp_start + rows];
 
-        for (y, (row, cells)) in row_rows.iter().zip(row_cells.iter()).enumerate() {
+        for (y, (row, cells)) in (self.clip.y as usize..).zip(row_rows.iter().zip(row_cells.iter())) {
             let cells_slice = cells.slice();
             for x in 0..cells_slice.len() {
                 let cell = cells_slice.raw[x];
@@ -2086,26 +2185,31 @@ impl RenderState {
     /// For example, you may want to hold a lock for the duration of the
     /// update and hyperlink lookup to ensure no updates happen in between.
     ///
-    /// Only viewport rows are searched, never overscan rows. Both the
-    /// given point and the returned cells use viewport coordinates.
+    /// Only viewport rows are searched, never overscan rows, and only the
+    /// clipped part of them when a clip is set. Both the given point and
+    /// the returned cells use viewport coordinates.
     pub fn link_cells(&self, viewport_point: point::Coordinate) -> CellSet {
         let mut result = CellSet::new();
 
         // Our viewport point is sent in by the caller and can't be trusted.
-        // If it is outside the valid area then just return empty because
+        // If it is outside the captured area then just return empty because
         // we can't possibly have a link there.
-        if viewport_point.x >= self.cols || viewport_point.y >= self.rows as u32 {
+        let clip = self.clip;
+        if viewport_point.x >= clip.cols
+            || viewport_point.y < clip.y as u32
+            || viewport_point.y - clip.y as u32 >= clip.rows as u32
+        {
             return result;
         }
 
         // This only covers the viewport, never overscan rows.
         let vp_start = self.viewport_start();
-        let rows = self.rows as usize;
+        let rows = clip.rows as usize;
         let row_pins = &self.row_data.pin[vp_start..vp_start + rows];
         let row_cells = &self.row_data.cells[vp_start..vp_start + rows];
 
         // Grab our link ID
-        let link_pin: Pin = row_pins[viewport_point.y as usize];
+        let link_pin: Pin = row_pins[(viewport_point.y - clip.y as u32) as usize];
         // SAFETY: the terminal has not changed since the last update
         // (function contract), so the pin's node is live.
         let link_page: &Page = unsafe { link_pin.node_mut().page() };
@@ -2126,7 +2230,7 @@ impl RenderState {
             unsafe { *link_page.hyperlink_set.get(link_page.memory, link_id) }
         };
 
-        for (y, (pin, cells)) in row_pins.iter().zip(row_cells.iter()).enumerate() {
+        for (y, (pin, cells)) in (clip.y as usize..).zip(row_pins.iter().zip(row_cells.iter())) {
             for (x, cell) in cells.raw.iter().enumerate() {
                 if !cell.hyperlink() {
                     continue;
@@ -3444,6 +3548,7 @@ mod tests {
         // Unused entries (outside row_data_range) may hold anything, so
         // we only compare the populated range.
         assert_eq!(fresh.overscan, incremental.overscan);
+        assert_eq!(fresh.clip, incremental.clip);
         assert_eq!(fresh.row_data_range(), incremental.row_data_range());
         let range = fresh.row_data_range();
 
@@ -3492,12 +3597,80 @@ mod tests {
 
     #[test]
     fn incremental_updates_match_full_rebuild() {
-        test_incremental_matches_fresh(Overscan::default());
+        test_incremental_matches_fresh(Overscan::default(), Clip::default());
     }
 
     #[test]
     fn incremental_updates_match_full_rebuild_with_overscan() {
-        test_incremental_matches_fresh(Overscan { above: 2, below: 1 });
+        test_incremental_matches_fresh(Overscan { above: 2, below: 1 }, Clip::default());
+    }
+
+    #[test]
+    fn incremental_updates_match_full_rebuild_with_a_clip() {
+        test_incremental_matches_fresh(Overscan::default(), Clip { y: 2, rows: 3, cols: 7 });
+    }
+
+    #[test]
+    fn incremental_updates_match_full_rebuild_with_a_clip_and_overscan() {
+        test_incremental_matches_fresh(Overscan { above: 2, below: 1 }, Clip { y: 1, rows: 4, cols: 12 });
+    }
+
+    /// Verifies that a clipped render state holds exactly the clipped part of
+    /// an unclipped state of the same terminal.
+    fn test_compare_clipped(clipped: &RenderState, full: &RenderState) {
+        let clip = clipped.clip;
+
+        assert_eq!(full.rows, clipped.rows);
+        assert_eq!(full.cols, clipped.cols);
+        assert!(clip.rows > 0);
+        assert!(clip.cols > 0);
+        assert!(clip.y + clip.rows <= full.rows);
+        assert!(clip.cols <= full.cols);
+
+        let expected_cursor: Option<CursorViewport> = 'cursor: {
+            let Some(vp) = full.cursor.viewport else {
+                break 'cursor None;
+            };
+            if vp.y < clip.y || vp.y >= clip.y + clip.rows {
+                break 'cursor None;
+            }
+            if vp.x >= clip.cols {
+                break 'cursor None;
+            }
+            Some(vp)
+        };
+        assert_eq!(expected_cursor, clipped.cursor.viewport);
+
+        let clipped_data = &clipped.row_data;
+        let full_data = &full.row_data;
+        let range = clipped.row_data_range();
+        for i in range.start..range.end {
+            let vy = clipped.viewport_y(i);
+            if vy < 0 || vy >= full.rows as isize {
+                continue;
+            }
+            let j: usize = full.viewport_start() + vy as usize;
+
+            assert_eq!(full_data.pin[j].node, clipped_data.pin[i].node, "mismatch on viewport row y={vy}");
+            assert_eq!(full_data.pin[j].y, clipped_data.pin[i].y, "mismatch on viewport row y={vy}");
+            assert_eq!(full_data.selection[j], clipped_data.selection[i], "mismatch on viewport row y={vy}");
+
+            let clipped_cells = clipped_data.cells[i].slice();
+            let full_cells = full_data.cells[j].slice();
+            assert_eq!(clip.cols as usize, clipped_cells.len());
+            for (a, b) in clipped_cells.raw.iter().zip(full_cells.raw[..clip.cols as usize].iter()) {
+                assert_eq!(b.to_bits(), a.to_bits(), "mismatch on viewport row y={vy}");
+            }
+            for x in 0..clip.cols as usize {
+                let cell = full_cells.raw[x];
+                if cell.style_id() != 0 {
+                    assert!(full_cells.style[x].eql(&clipped_cells.style[x]), "mismatch on viewport row y={vy}");
+                }
+                if cell.content_tag() == ContentTag::CodepointGrapheme {
+                    assert_eq!(full_cells.grapheme(x), clipped_cells.grapheme(x), "mismatch on viewport row y={vy}");
+                }
+            }
+        }
     }
 
     /// A small deterministic PRNG (xorshift64*) standing in for Zig's
@@ -3524,7 +3697,7 @@ mod tests {
         }
     }
 
-    fn test_incremental_matches_fresh(request: Overscan) {
+    fn test_incremental_matches_fresh(request: Overscan, clip: Clip) {
         // Deterministic so failures are reproducible.
         let mut rand = Prng(0xB0BA_CAFE);
 
@@ -3532,6 +3705,7 @@ mod tests {
 
         let mut inc = RenderState::empty();
         inc.overscan_request = request;
+        inc.clip_request = clip;
 
         for _ in 0..300 {
             // Perform a random batch of operations between updates.
@@ -3639,9 +3813,16 @@ mod tests {
 
             let mut fresh = RenderState::empty();
             fresh.overscan_request = request;
+            fresh.clip_request = clip;
             fresh.update(&mut t);
 
             test_compare_states(&inc, &fresh);
+
+            if !clip.eql(Clip::default()) {
+                let mut full = RenderState::empty();
+                full.update(&mut t);
+                test_compare_clipped(&fresh, &full);
+            }
         }
     }
 
@@ -4486,6 +4667,151 @@ mod tests {
         assert_eq!(Some([0, 9]), sels[vp + rows - 1]);
         assert_eq!(Some([0, 2]), sels[vp + rows]);
         assert!(sels[vp + rows - 2].is_none());
+    }
+
+    #[test]
+    fn clip_row_data_layout() {
+        let mut t = term_scrollback(10, 10, Some(1_000_000));
+
+        // The active area (and bottom viewport) holds "41".."49" and the
+        // empty cursor row.
+        test_write_numbered_lines(&mut t, 50);
+
+        let mut state = RenderState::empty();
+        state.clip_request = Clip { y: 3, rows: 4, cols: 1 };
+        state.update(&mut t);
+
+        assert_eq!(10, state.rows);
+        assert_eq!(10, state.cols);
+        assert!(state.clip.eql(Clip { y: 3, rows: 4, cols: 1 }));
+        assert_eq!(4, state.row_data.len());
+        assert_eq!(0, state.row_data_range().start);
+        assert_eq!(4, state.row_data_range().end);
+        assert_eq!(3, state.viewport_y(0));
+        assert_eq!(6, state.viewport_y(3));
+        for cells in &state.row_data.cells {
+            assert_eq!(1, cells.len());
+        }
+
+        // Only the leftmost digit of each row was captured.
+        assert_eq!(4, test_row_number(&state, 0).unwrap());
+        assert_eq!(4, test_row_number(&state, 3).unwrap());
+
+        // The cursor is on the last viewport row, outside the clip.
+        assert!(state.cursor.viewport.is_none());
+
+        // Overscan rows are captured around the clip, from inside the
+        // viewport here.
+        state.overscan_request = Overscan { above: 1, below: 2 };
+        state.clip_request = Clip { y: 3, rows: 4, cols: 0 };
+        state.update(&mut t);
+        assert!(state.overscan.eql(Overscan { above: 1, below: 2 }));
+        assert!(state.clip.eql(Clip { y: 3, rows: 4, cols: 10 }));
+        assert_eq!(7, state.row_data.len());
+        assert_eq!(2, state.viewport_y(0));
+        assert_eq!(43, test_row_number(&state, 0).unwrap());
+        assert_eq!(44, test_row_number(&state, 1).unwrap());
+        assert_eq!(49, test_row_number(&state, 6).unwrap());
+
+        // A clip that reaches the bottom of the viewport finds the cursor.
+        state.overscan_request = Overscan::default();
+        state.clip_request = Clip { y: 5, rows: 0, cols: 0 };
+        state.update(&mut t);
+        assert!(state.clip.eql(Clip { y: 5, rows: 5, cols: 10 }));
+        assert_eq!(9, state.cursor.viewport.unwrap().y);
+        assert_eq!(0, state.cursor.viewport.unwrap().x);
+    }
+
+    #[test]
+    fn clip_limited_to_the_viewport() {
+        let mut t = term(10, 5);
+
+        let mut state = RenderState::empty();
+
+        state.clip_request = Clip { y: 3, rows: 100, cols: 100 };
+        state.update(&mut t);
+        assert!(state.clip.eql(Clip { y: 3, rows: 2, cols: 10 }));
+        assert_eq!(2, state.row_data.len());
+
+        state.clip_request = Clip { y: 100, rows: 0, cols: 0 };
+        state.update(&mut t);
+        assert!(state.clip.eql(Clip { y: 4, rows: 1, cols: 10 }));
+        assert_eq!(1, state.row_data.len());
+
+        // The default clip is the whole viewport.
+        state.clip_request = Clip::default();
+        state.update(&mut t);
+        assert!(state.clip.eql(Clip { y: 0, rows: 5, cols: 10 }));
+        assert_eq!(5, state.row_data.len());
+    }
+
+    #[test]
+    fn clip_change_forces_redraw() {
+        let mut t = term_scrollback(10, 10, Some(1_000_000));
+        test_write_numbered_lines(&mut t, 50);
+
+        let mut state = RenderState::empty();
+        state.clip_request = Clip { y: 0, rows: 3, cols: 2 };
+        state.update(&mut t);
+        state.clean();
+
+        state.update(&mut t);
+        assert_eq!(Dirty::False, state.dirty);
+
+        // Same row count, new rows.
+        state.clip_request = Clip { y: 1, rows: 3, cols: 2 };
+        state.update(&mut t);
+        assert_eq!(Dirty::Full, state.dirty);
+        assert_eq!(42, test_row_number(&state, 0).unwrap());
+
+        // Same rows, more columns.
+        state.clean();
+        state.clip_request = Clip { y: 1, rows: 3, cols: 0 };
+        state.update(&mut t);
+        assert_eq!(Dirty::Full, state.dirty);
+        for cells in &state.row_data.cells {
+            assert_eq!(10, cells.len());
+        }
+        assert_eq!(42, test_row_number(&state, 0).unwrap());
+
+        // Only the clipped rows are captured, so output outside them still
+        // reaches the state once the clip covers them again.
+        state.clean();
+        write(&mut t, b"\x1b[10;1H77");
+        state.update(&mut t);
+        state.clean();
+        state.clip_request = Clip::default();
+        state.update(&mut t);
+        assert_eq!(Dirty::Full, state.dirty);
+        assert_eq!(77, test_row_number(&state, 9).unwrap());
+    }
+
+    #[test]
+    fn clip_string_and_link_cells() {
+        let mut t = term(10, 3);
+        write(&mut t, b"AB\r\n\x1b]8;;http://example.com\x1b\\LINK\x1b]8;;\x1b\\");
+
+        let mut state = RenderState::empty();
+        state.clip_request = Clip { y: 1, rows: 2, cols: 3 };
+        state.update(&mut t);
+
+        let mut w: Vec<u8> = Vec::new();
+        let mut map = StringMap::new();
+        state.string(&mut w, Some(&mut map)).unwrap();
+        assert_eq!(&b"LIN\n\x00\x00\x00\n"[..], &w[..]);
+        assert_eq!(1, map[0].y);
+        assert_eq!(2, map[map.len() - 1].y);
+
+        let cells = state.link_cells(point::Coordinate { x: 0, y: 1 });
+        assert_eq!(3, cells.len());
+        assert!(cells.contains(&point::Coordinate { x: 0, y: 1 }));
+        assert!(cells.contains(&point::Coordinate { x: 2, y: 1 }));
+
+        let outside = state.link_cells(point::Coordinate { x: 3, y: 1 });
+        assert_eq!(0, outside.len());
+
+        let above = state.link_cells(point::Coordinate { x: 0, y: 0 });
+        assert_eq!(0, above.len());
     }
 
     #[test]
