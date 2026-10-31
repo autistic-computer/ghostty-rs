@@ -18965,9 +18965,10 @@ mod tests {
         // Verify last page is full (so grow will need to allocate/reuse)
         assert!(pg(last(&s)).size.rows == pg(last(&s)).capacity.rows);
 
-        // Remember the first page memory pointer before the reuse attempt
+        // Remember the first page and the accounting before the reuse attempt
         let first_page_ptr = first(&s);
-        let first_page_mem_ptr = pg(first(&s)).memory.ptr();
+        let first_page_mem_len = pg(first(&s)).memory.len();
+        let page_size_before = s.page_size;
 
         // Create a tracked pin pointing to the non-standard first page
         let tracked_pin = s.track_pin(pin_at(first_page_ptr, 0, 0)).unwrap();
@@ -18982,8 +18983,17 @@ mod tests {
         assert!(first(&s) != first_page_ptr);
 
         // If the non-standard page was properly destroyed and not reused,
-        // the last page should not have the same memory pointer
-        assert!(pg(last(&s)).memory.ptr() != first_page_mem_ptr);
+        // the last page is a fresh standard pool page and page_size traded
+        // the heap page's bytes for one pool item. (Zig checks that the last
+        // page's memory pointer differs from the destroyed page's, but the
+        // pool's new item may be handed the address just freed, as the
+        // Windows heap does.)
+        assert_eq!(Owned::Pool, n(last(&s)).owned);
+        assert!(pg(last(&s)).memory.len() <= std_size());
+        assert_eq!(
+            page_size_before - first_page_mem_len + PagePool::item_size(),
+            s.page_size
+        );
 
         // The tracked pin should have been moved to the new first page and marked as garbage
         assert_eq!(first(&s), tp(tracked_pin).node);

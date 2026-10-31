@@ -1047,7 +1047,17 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
             return;
         }
-        let dir_handle = std::fs::File::open(&tmp).unwrap();
+        // A directory only opens with FILE_FLAG_BACKUP_SEMANTICS; without
+        // it CreateFileW fails with ERROR_ACCESS_DENIED.
+        let dir_handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&tmp)
+                .unwrap()
+        };
         let dir = Dir {
             handle: dir_handle.as_raw_handle() as HANDLE,
         };
