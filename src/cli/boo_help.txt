@@ -1,0 +1,1 @@
+The `boo` command is used to display the animation from the Ghostty website in the terminal

@@ -1,0 +1,17 @@
+The `list-keybinds` command is used to list all the available keybinds for
+Ghostty.
+
+When executed without any arguments this will list the current keybinds
+loaded by the config file. If no config file is found or there aren't any
+changes to the keybinds it will print out the default ones configured for
+Ghostty
+
+Flags:
+
+  * `--default`: will print out all the default keybinds
+
+  * `--docs`: currently does nothing, intended to print out documentation
+    about the action associated with the keybinds
+
+  * `--plain`: will disable formatting and make the output more
+    friendly for Unix tooling. This is default when not printing to a tty.

@@ -1,0 +1,62 @@
+# Port of `test/fuzz-libghostty/build.zig`: fuzz harnesses for libghostty-vt.
+#
+# The Zig build links each harness into an AFL++-instrumented binary. Here
+# every target is a library function with two front ends:
+# - `fuzz_targets/<name>.rs`: libFuzzer targets for `cargo fuzz`
+#   (`cargo +nightly fuzz run <name> --fuzz-dir test/fuzz-libghostty`).
+# - `src/bin/fuzz-<name>.rs`: read one input from stdin, like the Zig
+#   binaries (`afl.c`), for replaying crashes or running under AFL++.
+[package]
+name = "ghostty-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not part of the main workspace.
+[workspace]
+
+[dependencies]
+ghostty = { path = "../..", default-features = false }
+libfuzzer-sys = { version = "0.4", optional = true }
+
+[features]
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[[bin]]
+name = "fuzz-osc"
+path = "src/bin/fuzz-osc.rs"
+
+[[bin]]
+name = "fuzz-parser"
+path = "src/bin/fuzz-parser.rs"
+
+[[bin]]
+name = "fuzz-stream"
+path = "src/bin/fuzz-stream.rs"
+
+[[bin]]
+name = "osc"
+path = "fuzz_targets/osc.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "stream"
+path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]

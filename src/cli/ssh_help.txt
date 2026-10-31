@@ -1,0 +1,112 @@
+Wrap `ssh` to automatically configure Ghostty terminal integration on
+remote hosts.
+
+Any arguments that aren't recognized as `+ssh` flags are passed to
+the real `ssh` binary unchanged. You can use `--` as an explicit
+disambiguator if needed, though it's almost never required: `ssh`
+has no long flags, and `+ssh` defines no short flags, so there's
+nothing to collide.
+
+This is typically called via Ghostty's shell integration. When
+`shell-integration-features` includes `ssh-env` or `ssh-terminfo`,
+each shell defines an `ssh` function that runs:
+
+    ghostty +ssh <flags> -- "$@"
+
+You can also run `ghostty +ssh` directly, or alias it yourself (e.g.
+`alias ssh='ghostty +ssh --'`) if you prefer not to use the shell
+integration.
+
+Before it starts `ssh`, `+ssh` can do two pieces of setup. Both are
+on by default, and each has its own flag:
+
+  1. **Forward Ghostty's environment** (`--forward-env`). Asks `ssh` to
+     send `COLORTERM`, `TERM_PROGRAM`, and `TERM_PROGRAM_VERSION` to the
+     remote host using `SendEnv`. Programs on the remote host can use
+     these to tell that they're running inside Ghostty. The remote
+     server only accepts them if its `sshd_config` allows them:
+
+         AcceptEnv COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION
+
+  2. **Install Ghostty's terminfo** (`--terminfo`). The first time you
+     connect to a host, `+ssh` copies Ghostty's terminfo entry to it and
+     compiles it with `tic`. This teaches programs on the remote host
+     how to use the `xterm-ghostty` terminal type. Successful installs
+     are cached (see `ghostty +ssh-cache`), so later connections to the
+     same host skip this step.
+
+When either flag is enabled, `+ssh` also sets `TERM` for the remote
+session:
+
+  * `xterm-ghostty` if the terminfo entry was just installed, or if the
+    host is already in the cache.
+
+  * `xterm-256color` in every other case. This includes
+    `--terminfo=false` and installs that fail, for example because the
+    remote host has no `tic`. A failed install prints a warning, and the
+    connection continues. Almost every system knows `xterm-256color`,
+    so it's a safe fallback.
+
+`+ssh` sets `TERM` in the environment of the `ssh` process instead of
+passing `-o SetEnv=TERM=...`. `ssh` always sends `TERM` when it opens a
+remote terminal, so the server doesn't need to allow it with
+`AcceptEnv`. This also keeps any `SetEnv` lines in your `~/.ssh/config`
+working. `ssh` only uses the first `SetEnv` it finds, so a `SetEnv` on
+the command line would quietly replace yours.
+
+When both flags are disabled, `+ssh` leaves `TERM` alone and runs
+`ssh` with your environment unchanged.
+
+Flags:
+
+  * `--forward-env=<bool>`: Send `COLORTERM`, `TERM_PROGRAM`, and
+    `TERM_PROGRAM_VERSION` to the remote host. Default: `true`.
+
+  * `--terminfo=<bool>`: Install Ghostty's terminfo on the first
+    connection to each host, and use `xterm-ghostty` as `TERM` when it's
+    available. Default: `true`.
+
+  * `--cache=<bool>`: Use the terminfo install cache. Default: `true`.
+    When `false`, both the cache read (skip-if-installed) and the
+    cache write (record-on-success) are bypassed, and every
+    connection performs the install. To one-shot reinstall a single
+    host while keeping the cache in use, prefer `ghostty +ssh-cache
+    --remove=<host>` followed by a normal connection.
+
+  * `--ssh=<path>`: Path to the `ssh` binary to execute. Default: the
+    first `ssh` found on `PATH`.
+
+  * `--verbose`: Print +ssh status lines to stderr, and surface
+    remote stderr during the terminfo install.
+
+Examples:
+
+    # Basic invocation using defaults:
+    ghostty +ssh user@example.com
+
+    # Forward Ghostty env vars but skip the terminfo install.
+    # The remote session uses TERM=xterm-256color:
+    ghostty +ssh --terminfo=false user@example.com
+
+    # Install terminfo but don't send any extra env vars:
+    ghostty +ssh --forward-env=false user@example.com
+
+    # SetEnv lines in your ssh config still apply. With this entry in
+    # ~/.ssh/config:
+    #
+    #   Host dev
+    #       SetEnv EDITOR=vim
+    #
+    # ssh still sends EDITOR=vim, along with the TERM chosen by +ssh:
+    ghostty +ssh dev
+
+    # `ssh` flags (short-form `-p`, etc.) pass through unchanged:
+    ghostty +ssh -p 2222 -i ~/.ssh/id_ed25519 user@example.com
+
+    # Use `--` explicitly if your ssh args might collide with our flags:
+    ghostty +ssh -- --some-rare-ssh-arg user@example.com
+
+Pass `--verbose` to see what `+ssh` is doing. For cache inspection
+and management, see `ghostty +ssh-cache`.
+
+Available since: 1.4.0

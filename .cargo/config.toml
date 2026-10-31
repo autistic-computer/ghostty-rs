@@ -1,0 +1,3 @@
+[build]
+# Many agents build in parallel on a 4-core / 15 GB box; keep each build lean.
+jobs = 2

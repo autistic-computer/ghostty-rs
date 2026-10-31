@@ -1,0 +1,133 @@
+[package]
+name = "ghostty"
+version = "1.4.1"
+edition = "2021"
+description = "Rust port of the Ghostty terminal emulator"
+license = "MIT"
+autobins = false
+
+# Each checkout (including agent worktrees nested under .claude/) is its own workspace root.
+[workspace]
+
+[lib]
+name = "ghostty"
+path = "src/root.rs"
+
+[[bin]]
+name = "ghostty"
+path = "src/main.rs"
+
+[[bin]]
+name = "ghostty-bench"
+path = "src/bin/ghostty-bench.rs"
+
+[[bin]]
+name = "ghostty-build-data"
+path = "src/bin/ghostty-build-data.rs"
+
+[[bin]]
+name = "ghostty-gen"
+path = "src/bin/ghostty-gen.rs"
+
+[[bin]]
+name = "mdgen_ghostty_1"
+path = "src/build/mdgen/main_ghostty_1.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "mdgen_ghostty_5"
+path = "src/build/mdgen/main_ghostty_5.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "webgen_actions"
+path = "src/build/webgen/main_actions.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "webgen_commands"
+path = "src/build/webgen/main_commands.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "webgen_config"
+path = "src/build/webgen/main_config.rs"
+required-features = ["docs"]
+
+[features]
+# The GTK application runtime is the default on Linux; build the
+# runtime-less helper CLI (and the stand-in apprt) with
+# `--no-default-features`.
+default = ["gtk"]
+# The man page (`mdgen_*`) and website reference (`webgen_*`) generators
+# (Zig: `-Demit-docs` / `-Demit-webdata`).
+docs = []
+inspector = []
+# Crash reporting via the Sentry native SDK (links the system `sentry` C library).
+sentry = []
+gtk = [
+    "dep:bitflags",
+    "dep:gdk4-wayland",
+    "dep:gdk4-x11",
+    "dep:gio",
+    "dep:glib",
+    "dep:gtk4",
+    "dep:libadwaita",
+    "dep:wayland-backend",
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:wayland-protocols-plasma",
+    "dep:wayland-scanner",
+    "dep:x11",
+]
+# gtk4-layer-shell support for the GTK quick terminal. Needs the system
+# `gtk4-layer-shell-0` library, so it is not part of `gtk` itself.
+gtk-layer-shell = ["gtk", "dep:gtk4-layer-shell"]
+
+[dependencies]
+base64 = "0.22"
+# Used by the wayland-scanner generated vicinae-hotkey protocol code.
+bitflags = { version = "2", optional = true }
+crossterm = "0.29"
+flate2 = "1"
+gdk4-wayland = { version = "0.10", optional = true, features = ["v4_12", "wayland_crate"] }
+gdk4-x11 = { version = "0.10", optional = true, features = ["v4_4", "xlib"] }
+getrandom = "0.3"
+gio = { version = "0.21", optional = true }
+glib = { version = "0.21", optional = true, features = ["v2_74"] }
+gtk4 = { version = "0.10", optional = true, features = ["v4_14"] }
+gtk4-layer-shell = { version = "0.7", optional = true }
+half = "2"
+indexmap = "2"
+libadwaita = { version = "0.8", optional = true, features = ["v1_5"] }
+libc = "0.2"
+log = "0.4"
+memchr = "2"
+miniz_oxide = "0.8"
+naga = { version = "30", features = ["glsl-in", "glsl-out", "msl-out", "spv-in", "spv-out"] }
+png = "0.18"
+serde_json = { version = "1", features = ["preserve_order"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+wayland-backend = { version = "0.3", optional = true, features = ["client_system"] }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "0.3", optional = true, features = ["client"] }
+wayland-scanner = { version = "0.31", optional = true }
+x11 = { version = "2", optional = true, features = ["xlib"] }
+zune-jpeg = "0.5"
+
+[dev-dependencies]
+png = "0.18"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
