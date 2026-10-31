@@ -813,7 +813,7 @@ impl<'a> Handler<'a> {
         func(self, value);
     }
 
-    #[inline]
+    #[inline(always)]
     fn vt_fallible(&mut self, action: Action<'_>) -> Result<(), VtError> {
         match action {
             Action::Print(v) => self.terminal.print(v.cp)?,
@@ -2328,7 +2328,19 @@ impl<'a> Handler<'a> {
 }
 
 impl stream::Handler for Handler<'_> {
-    #[inline]
+    #[inline(always)]
+    fn print_ascii(&mut self, cps: &[u32]) {
+        if let Err(err) = self.terminal.print_ascii_slice(cps).map_err(VtError::from) {
+            self.semantic_failure = true;
+            log::warn!(
+                target: LOG_TARGET,
+                "error handling VT action action=print_slice err={}",
+                err
+            );
+        }
+    }
+
+    #[inline(always)]
     fn vt(&mut self, action: Action<'_>) {
         let key = action.key();
         if let Err(err) = self.vt_fallible(action) {

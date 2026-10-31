@@ -3355,6 +3355,22 @@ impl<T: Packed, const MASK: u64, const G: usize> Mask<T, MASK, G> {
     #[inline(always)]
     pub fn eql_prefix(values: &[T], i: usize, expected: u64) -> usize {
         let group = Self::load(values, i);
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if G == 4 {
+            use std::arch::aarch64::*;
+            // SAFETY: NEON is enabled and group contains exactly four u64s.
+            // Both unaligned two-lane loads are within that array.
+            let all_equal = unsafe {
+                let mask = vdupq_n_u64(Self::MASK_VALUE);
+                let wanted = vdupq_n_u64(expected);
+                let first = vceqq_u64(vandq_u64(vld1q_u64(group.as_ptr()), mask), wanted);
+                let second = vceqq_u64(vandq_u64(vld1q_u64(group.as_ptr().add(2)), mask), wanted);
+                vminvq_u32(vreinterpretq_u32_u64(vandq_u64(first, second))) == u32::MAX
+            };
+            if all_equal {
+                return G;
+            }
+        }
         group
             .iter()
             .position(|v| v & Self::MASK_VALUE != expected)
@@ -3456,11 +3472,10 @@ mod tests {
     type M1 = Mask<Cell, { field_mask(&[cell_fields::CONTENT_TAG, cell_fields::STYLE_ID]) }, 4>;
     type M2 = Mask<Cell, { field_mask(&[cell_fields::CONTENT_CODEPOINT_DATA]) }, 4>;
 
-    // The page layout must match Zig's byte for byte: it decides how many
-    // rows a page of a given width holds (and so scrollback memory and the
-    // page records of snapshots). Zig: `Page.layout(std_capacity)` with
-    // the non-test grapheme capacity is 401408 bytes and adjusting it to
-    // 215 columns gives 217 rows.
+    // Page size affects scrollback capacity and snapshot page records.
+    // These values come from Page.layout/Capacity.adjust in Zig, with the
+    // non-test grapheme capacity. Apple ARM64 uses 16 KiB pages; other
+    // supported targets here use 4 KiB pages.
     #[test]
     fn std_capacity_layout_matches_zig() {
         let cap = Capacity {
@@ -3470,9 +3485,14 @@ mod tests {
         let meta = MetaLayout::init(cap);
         assert_eq!(4000, meta.styles_layout.total_size);
         assert_eq!(26124, meta.total_size);
-        assert_eq!(401408, Page::layout(cap).total_size);
+        let (total_size, rows) = if crate::terminal::mem::PAGE_SIZE_MIN == 16384 {
+            (409600, 221)
+        } else {
+            (401408, 217)
+        };
+        assert_eq!(total_size, Page::layout(cap).total_size);
         let adjusted = cap.adjust(Adjustment { cols: Some(215) }).unwrap();
-        assert_eq!(217, adjusted.rows);
+        assert_eq!(rows, adjusted.rows);
     }
 
     #[test]
@@ -3518,6 +3538,15 @@ mod tests {
 
             cells[2] = styled;
             assert_eq!(4, M::eql_prefix(&cells, 0, expected));
+
+            // Every combination of mismatching lanes must report the first
+            // mismatch, including groups with no mismatch at all.
+            for mismatches in 0u32..16 {
+                let cells: [Cell; 4] = core::array::from_fn(|i| {
+                    if mismatches & (1 << i) != 0 { other } else { styled2 }
+                });
+                assert_eq!(mismatches.trailing_zeros().min(4) as usize, M::eql_prefix(&cells, 0, expected));
+            }
         }
 
         // eqlExact: bit-identical values only

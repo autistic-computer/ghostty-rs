@@ -5,7 +5,7 @@
 //! The Zig SIMD build calls `vt.cpp` (Highway + simdutf). This port replaces
 //! it with a Rust implementation of the same structure: an ASCII fast path
 //! that fuses the ESC scan with the UTF-8 -> UTF-32 widening 16 bytes at a
-//! time (SSE2 on x86_64, SWAR elsewhere), falling back on the first non-ASCII
+//! time (SSE2 on x86_64, NEON on aarch64, SWAR elsewhere), falling back on the first non-ASCII
 //! byte to a `memchr` ESC search plus the scalar maximal-subpart decoder.
 //! Results are identical to `utf8_decode_until_control_seq_scalar` (checked
 //! by the differential test, as in Zig).
@@ -31,6 +31,16 @@ pub struct DecodeResult {
 /// `output` must be at least as long as `input`.
 #[inline]
 pub fn utf8_decode_until_control_seq(input: &[u8], output: &mut [u32]) -> DecodeResult {
+    utf8_decode_until_control_seq_with_ascii(input, output).0
+}
+
+/// The flag is true only when every decoded codepoint is ASCII. It is
+/// derived from the decoder's existing checks, including invalid UTF-8.
+#[inline]
+pub(crate) fn utf8_decode_until_control_seq_with_ascii(
+    input: &[u8],
+    output: &mut [u32],
+) -> (DecodeResult, bool) {
     debug_assert!(output.len() >= input.len());
 
     // ASCII fast path: terminal input is overwhelmingly ASCII, for which
@@ -54,48 +64,66 @@ pub fn utf8_decode_until_control_seq(input: &[u8], output: &mut [u32]) -> Decode
             continue;
         }
 
-        let stop_idx = i + stop_mask.trailing_zeros() as usize;
+        let stop_idx = i + (stop_mask.trailing_zeros() / STOP_BITS_PER_BYTE) as usize;
         if input[stop_idx] == 0x1B {
             // ESC: everything before it was ASCII, one codepoint per byte.
-            return DecodeResult {
-                consumed: stop_idx,
-                decoded: stop_idx,
-            };
+            return (
+                DecodeResult {
+                    consumed: stop_idx,
+                    decoded: stop_idx,
+                },
+                true,
+            );
         }
 
         // Non-ASCII: decode the rest (up to an ESC) with the full decoder.
-        return decode_non_ascii_until_control_seq(input, stop_idx, output);
+        return (
+            decode_non_ascii_until_control_seq(input, stop_idx, output),
+            false,
+        );
     }
 
     // Leftover input (< CHUNK bytes): process one byte at a time.
     while i < count {
         let b = input[i];
         if b == 0x1B {
-            return DecodeResult {
-                consumed: i,
-                decoded: i,
-            };
+            return (
+                DecodeResult {
+                    consumed: i,
+                    decoded: i,
+                },
+                true,
+            );
         }
         if b >= 0x80 {
-            return decode_non_ascii_until_control_seq(input, i, output);
+            return (decode_non_ascii_until_control_seq(input, i, output), false);
         }
         output[i] = b as u32;
         i += 1;
     }
 
     // The entire input was ASCII (no ESC, no partial sequences possible).
-    DecodeResult {
-        consumed: count,
-        decoded: count,
-    }
+    (
+        DecodeResult {
+            consumed: count,
+            decoded: count,
+        },
+        true,
+    )
 }
 
 const CHUNK: usize = 16;
+const STOP_BITS_PER_BYTE: u32 = if cfg!(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    target_endian = "little"
+)) { 4 } else { 1 };
 
-/// Widen 16 ASCII bytes into `out` and return a bitmask (bit k for byte k)
-/// of the bytes that stop the ASCII fast path: ESC or any byte >= 0x80.
+/// Widen 16 bytes into `out` and mark ESC or any byte >= 0x80.
+/// Each input byte occupies STOP_BITS_PER_BYTE consecutive flag bits.
+/// Only zero/nonzero and the first flagged byte are used by the decoder.
 #[inline(always)]
-fn widen_ascii_chunk(chunk: &[u8; CHUNK], out: &mut [u32; CHUNK]) -> u32 {
+fn widen_ascii_chunk(chunk: &[u8; CHUNK], out: &mut [u32; CHUNK]) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::*;
@@ -115,18 +143,57 @@ fn widen_ascii_chunk(chunk: &[u8; CHUNK], out: &mut [u32; CHUNK]) -> u32 {
             _mm_storeu_si128(p.add(1), _mm_unpackhi_epi16(lo, zero));
             _mm_storeu_si128(p.add(2), _mm_unpacklo_epi16(hi, zero));
             _mm_storeu_si128(p.add(3), _mm_unpackhi_epi16(hi, zero));
+            u64::from(mask)
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        // SAFETY: NEON is enabled. The input and output arrays contain
+        // 16 bytes and 16 u32s respectively; every load and store fits.
+        unsafe {
+            let v = vld1q_u8(chunk.as_ptr());
+            let stop = vorrq_u8(vceqq_u8(v, vdupq_n_u8(0x1B)), vcgeq_u8(v, vdupq_n_u8(0x80)));
+            // Four flag bits per byte preserve the first stop position
+            // without the two horizontal sums needed for a compact mask.
+            #[cfg(target_endian = "little")]
+            let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                vreinterpretq_u16_u8(stop),
+            )));
+            #[cfg(target_endian = "big")]
+            let mask = {
+                let weights = [1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+                let bits = vandq_u8(stop, vld1q_u8(weights.as_ptr()));
+                u64::from(vaddv_u8(vget_low_u8(bits)))
+                    | (u64::from(vaddv_u8(vget_high_u8(bits))) << 8)
+            };
+
+            let lo = vmovl_u8(vget_low_u8(v));
+            let hi = vmovl_u8(vget_high_u8(v));
+            let p = out.as_mut_ptr();
+            vst1q_u32(p, vmovl_u16(vget_low_u16(lo)));
+            vst1q_u32(p.add(4), vmovl_u16(vget_high_u16(lo)));
+            vst1q_u32(p.add(8), vmovl_u16(vget_low_u16(hi)));
+            vst1q_u32(p.add(12), vmovl_u16(vget_high_u16(hi)));
             mask
         }
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_feature = "neon")
+    )))]
     {
-        widen_ascii_chunk_portable(chunk, out)
+        u64::from(widen_ascii_chunk_portable(chunk, out))
     }
 }
 
 /// Portable (SWAR) version of [`widen_ascii_chunk`].
-#[cfg(any(not(target_arch = "x86_64"), test))]
+#[cfg(any(
+    not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_feature = "neon"))),
+    test
+))]
 #[inline(always)]
 fn widen_ascii_chunk_portable(chunk: &[u8; CHUNK], out: &mut [u32; CHUNK]) -> u32 {
     for (o, &b) in out.iter_mut().zip(chunk.iter()) {
@@ -140,7 +207,10 @@ fn widen_ascii_chunk_portable(chunk: &[u8; CHUNK], out: &mut [u32; CHUNK]) -> u3
 /// For 8 little-endian bytes, a bitmask with bit k set for bytes that are
 /// ESC or >= 0x80. Bits above the first set bit may be spurious (borrow
 /// propagation), which is fine since only the lowest set bit is used.
-#[cfg(any(not(target_arch = "x86_64"), test))]
+#[cfg(any(
+    not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_feature = "neon"))),
+    test
+))]
 #[inline(always)]
 fn swar_stop_mask(w: u64) -> u64 {
     const LO: u64 = 0x0101_0101_0101_0101;
@@ -360,7 +430,11 @@ mod tests {
                 };
             }
 
-            let res_simd = utf8_decode_until_control_seq(&input[..len], &mut out_simd);
+            let (res_simd, ascii) =
+                utf8_decode_until_control_seq_with_ascii(&input[..len], &mut out_simd);
+            if ascii {
+                assert!(out_simd[..res_simd.decoded].iter().all(|&cp| cp < 0x80));
+            }
             let res_scalar = utf8_decode_until_control_seq_scalar(&input[..len], &mut out_scalar);
             assert_eq!(res_scalar.consumed, res_simd.consumed, "input={:x?}", &input[..len]);
             assert_eq!(res_scalar.decoded, res_simd.decoded, "input={:x?}", &input[..len]);
@@ -370,6 +444,20 @@ mod tests {
                 "input={:x?}",
                 &input[..len]
             );
+        }
+    }
+
+    #[test]
+    fn ascii_classification_rejects_replacement_codepoints() {
+        let mut out = [0u32; 64];
+        for input in [b"ASCII\x1b".as_slice(), b"\x00\x1f\x7f".as_slice()] {
+            let (_, ascii) = utf8_decode_until_control_seq_with_ascii(input, &mut out);
+            assert!(ascii);
+        }
+        for input in [b"bad\xff".as_slice(), b"bad\xc0\xaf".as_slice()] {
+            let (result, ascii) = utf8_decode_until_control_seq_with_ascii(input, &mut out);
+            assert_eq!(result.consumed, result.decoded);
+            assert!(!ascii);
         }
     }
 
@@ -415,7 +503,7 @@ mod tests {
             assert_eq!(a, b);
             assert_eq!(ma == 0, mb == 0);
             if ma != 0 {
-                assert_eq!(ma.trailing_zeros(), mb.trailing_zeros());
+                assert_eq!(ma.trailing_zeros() / STOP_BITS_PER_BYTE, mb.trailing_zeros());
             }
         }
     }

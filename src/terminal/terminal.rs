@@ -1175,6 +1175,19 @@ impl Terminal {
     /// slower per-codepoint path. They're less common and this is optimized
     /// for the aforementioned cases.
     pub fn print_slice(&mut self, cps: &[u32]) -> Result<(), IncreaseCapacityError> {
+        self.print_slice_impl::<false>(cps)
+    }
+
+    /// Stream-only entry point after ASCII decoding and control filtering.
+    pub(crate) fn print_ascii_slice(&mut self, cps: &[u32]) -> Result<(), IncreaseCapacityError> {
+        debug_assert!(cps.iter().all(|&cp| (0x20..=0x7F).contains(&cp)));
+        self.print_slice_impl::<true>(cps)
+    }
+
+    fn print_slice_impl<const ASCII: bool>(
+        &mut self,
+        cps: &[u32],
+    ) -> Result<(), IncreaseCapacityError> {
         // Check if we can do the fast path up front. If we can't
         // we need to go back to scalar `print`.
         let fast = 'fast: {
@@ -1231,7 +1244,11 @@ impl Terminal {
         while i < cps.len() {
             // Try the fast-path print first. This will return the number of
             // codepoints it consumed.
-            let consumed = self.print_slice_fast(&cps[i..], grapheme_cluster, allow_unicode)?;
+            let consumed = if ASCII {
+                self.print_slice_fill::<false, true>(&cps[i..], grapheme_cluster, allow_unicode)?
+            } else {
+                self.print_slice_fast(&cps[i..], grapheme_cluster, allow_unicode)?
+            };
             if consumed > 0 {
                 i += consumed;
                 continue;
@@ -1289,7 +1306,7 @@ impl Terminal {
             if cp0 < 0x10 {
                 return Ok(0);
             }
-            return self.print_slice_fill::<false>(cps, grapheme_cluster, allow_unicode);
+            return self.print_slice_fill::<false, false>(cps, grapheme_cluster, allow_unicode);
         }
 
         if !allow_unicode {
@@ -1356,8 +1373,8 @@ impl Terminal {
         // between the two instantiations rather than passing the width
         // through as an argument.
         match unicode::TABLE.get(cp0).width {
-            1 => self.print_slice_fill::<false>(cps, grapheme_cluster, allow_unicode),
-            2 => self.print_slice_fill::<true>(cps, grapheme_cluster, allow_unicode),
+            1 => self.print_slice_fill::<false, false>(cps, grapheme_cluster, allow_unicode),
+            2 => self.print_slice_fill::<true, false>(cps, grapheme_cluster, allow_unicode),
             _ => Ok(0),
         }
     }
@@ -1365,13 +1382,13 @@ impl Terminal {
     /// The row-filling portion of the printSlice fast path, specialized by
     /// width class. The first codepoint must already be validated by the
     /// caller (printSliceFast).
-    fn print_slice_fill<const WIDE: bool>(
+    fn print_slice_fill<const WIDE: bool, const ASCII: bool>(
         &mut self,
         cps: &[u32],
         grapheme_cluster: bool,
         allow_unicode: bool,
     ) -> Result<usize, IncreaseCapacityError> {
-        let r = self.print_slice_fill_::<WIDE>(cps, grapheme_cluster, allow_unicode);
+        let r = self.print_slice_fill_::<WIDE, ASCII>(cps, grapheme_cluster, allow_unicode);
 
         // After doing any printing, wrapping, scrolling, etc. we want to
         // ensure that our screen remains in a consistent state.
@@ -1379,7 +1396,7 @@ impl Terminal {
         r
     }
 
-    fn print_slice_fill_<const WIDE: bool>(
+    fn print_slice_fill_<const WIDE: bool, const ASCII: bool>(
         &mut self,
         cps: &[u32],
         grapheme_cluster: bool,
@@ -1397,7 +1414,24 @@ impl Terminal {
         // in the run is always written as a fresh, single-codepoint cell,
         // so the grapheme break check against it is exact.
         let run_len: usize = 'run: {
+            if ASCII {
+                break 'run cps.len();
+            }
             let mut idx: usize = 1;
+            if !WIDE {
+                // Check a full group without short-circuiting so the compiler
+                // can vectorize the common narrow run. The scalar loop below
+                // locates the first exception and handles Unicode as before.
+                for group in cps[1..].chunks_exact(4) {
+                    let narrow = group.iter().fold(true, |all, &cp| {
+                        all & (0x10..=0xFF).contains(&cp)
+                    });
+                    if !narrow {
+                        break;
+                    }
+                    idx += 4;
+                }
+            }
             while idx < cps.len() {
                 let cp = cps[idx];
                 if !WIDE && (0x10..=0xFF).contains(&cp) {

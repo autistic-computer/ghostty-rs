@@ -581,6 +581,13 @@ pub trait Handler {
     /// Handlers that care about text must handle both.
     fn vt(&mut self, action: Action<'_>);
 
+    /// A printable run already classified as ASCII by the decoder.
+    /// The default keeps existing handlers' PrintSlice delivery unchanged.
+    #[inline(always)]
+    fn print_ascii(&mut self, cps: &[u32]) {
+        self.vt(Action::PrintSlice(PrintSlice { cps }));
+    }
+
     /// A handler can expose this to get the raw action before it is
     /// further parsed. If this returns `true` then the stream skips
     /// processing it. Only called when `HAS_VT_RAW` is true.
@@ -599,6 +606,11 @@ impl<T: Handler + ?Sized> Handler for &mut T {
     #[inline(always)]
     fn vt(&mut self, action: Action<'_>) {
         (**self).vt(action)
+    }
+
+    #[inline(always)]
+    fn print_ascii(&mut self, cps: &[u32]) {
+        (**self).print_ascii(cps)
     }
 
     #[inline(always)]
@@ -1022,7 +1034,9 @@ impl<H: Handler> Stream<H> {
         // input until we see an ESC (0x1B), since all other characters
         // up to that point are just UTF-8.
         while self.parser.state == ParserState::Ground && offset < input.len() {
-            let res = crate::simd::vt::utf8_decode_until_control_seq(&input[offset..], cp_buf);
+            let (res, ascii) = crate::simd::vt::utf8_decode_until_control_seq_with_ascii(
+                &input[offset..], cp_buf,
+            );
             let cps = &cp_buf[..res.decoded];
 
             // Hand runs of printable codepoints to the handler as
@@ -1058,27 +1072,53 @@ impl<H: Handler> Stream<H> {
                 // and printable runs dominate real input, so scan
                 // several codepoints at a time manually.
                 let mut end = i + 1;
-                {
-                    const LANES: usize = 16;
-                    while end + LANES <= cps.len() {
-                        // Non-printable (C0 or decoded C1) is
-                        // equivalent to "no bit outside 0x9F is
-                        // set": one AND-test per lane.
-                        let stop = cps[end..end + LANES]
-                            .iter()
-                            .fold(false, |acc, &v| acc | (v & !0x9F == 0));
-                        if stop {
-                            break;
+                'scan: {
+                    #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
+                    {
+                        use std::arch::aarch64::*;
+                        while end + 4 <= cps.len() {
+                            // SAFETY: NEON is enabled and four codepoints remain.
+                            // Narrowing the comparison flags does not access memory.
+                            let stops = unsafe {
+                                let v = vld1q_u32(cps.as_ptr().add(end));
+                                let control = vceqq_u32(vandq_u32(v, vdupq_n_u32(!0x9F)), vdupq_n_u32(0));
+                                // Keep sixteen flag bits per lane in one integer.
+                                vget_lane_u64::<0>(vreinterpret_u64_u16(vmovn_u32(control)))
+                            };
+                            if stops != 0 {
+                                end += (stops.trailing_zeros() / 16) as usize;
+                                break 'scan;
+                            }
+                            end += 4;
                         }
-                        end += LANES;
+                    }
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little")))]
+                    {
+                        const LANES: usize = 16;
+                        while end + LANES <= cps.len() {
+                            // Non-printable (C0 or decoded C1) is
+                            // equivalent to "no bit outside 0x9F is
+                            // set": one AND-test per lane.
+                            let stop = cps[end..end + LANES]
+                                .iter()
+                                .fold(false, |acc, &v| acc | (v & !0x9F == 0));
+                            if stop {
+                                break;
+                            }
+                            end += LANES;
+                        }
                     }
                     while end < cps.len() && cps[end] & !0x9F != 0 {
                         end += 1;
                     }
                 }
-                self.handler.vt(Action::PrintSlice(PrintSlice {
-                    cps: &cps[i..end],
-                }));
+                if ascii {
+                    self.handler.print_ascii(&cps[i..end]);
+                } else {
+                    self.handler.vt(Action::PrintSlice(PrintSlice {
+                        cps: &cps[i..end],
+                    }));
+                }
                 i = end;
             }
             // Consume the bytes we just processed.
@@ -3943,10 +3983,10 @@ mod tests {
 
             // Batched path with a run long enough to exercise the
             // vectorized printable-run scan on either side of the control.
-            {
+            for index in 29..33 {
                 let mut s: Stream<PrintBuf> = s();
                 let mut input = [b'A'; 65];
-                input[32] = c;
+                input[index] = c;
                 s.next_slice(&input);
                 assert_eq!(64, s.handler.buf.len());
                 for &cp in &s.handler.buf {
@@ -3984,11 +4024,11 @@ mod tests {
 
             // Batched path with a run long enough to exercise the
             // vectorized printable-run scan on either side of the control.
-            {
+            for index in 29..33 {
                 let mut s: Stream<PrintBuf> = s();
                 let mut input = [b'A'; 66];
-                input[32] = enc[0];
-                input[33] = enc[1];
+                input[index] = enc[0];
+                input[index + 1] = enc[1];
                 s.next_slice(&input);
                 assert_eq!(64, s.handler.buf.len());
                 for &cp in &s.handler.buf {

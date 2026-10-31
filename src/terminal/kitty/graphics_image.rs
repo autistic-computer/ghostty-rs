@@ -1250,17 +1250,23 @@ pub(crate) mod test_util {
 
     impl TmpDir {
         pub fn new() -> TmpDir {
+            Self::new_in(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("tmp"),
+            )
+        }
+
+        pub fn new_in(parent: &Path) -> TmpDir {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let sub_path = format!(
                 "kitty-{}-{}",
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             );
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("tmp")
-                .join(&sub_path);
-            std::fs::create_dir_all(&path).unwrap();
+            std::fs::create_dir_all(parent).unwrap();
+            let path = parent.join(&sub_path);
+            std::fs::create_dir(&path).unwrap();
             TmpDir { sub_path, path }
         }
 
@@ -1406,7 +1412,7 @@ mod tests {
             libc::shm_open(
                 namez.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                0o600 as libc::mode_t,
+                0o600 as libc::c_uint,
             )
         };
         if fd < 0 {
@@ -1737,7 +1743,14 @@ mod tests {
 
     #[test]
     fn image_load_temporary_file_outside_directory_prefix_is_rejected() {
-        let tmp_dir = TmpDir::new();
+        // The checkout itself may be under /tmp (or /private/tmp on
+        // macOS), which is allowed independently of the configured temp
+        // directory. Keep this rejection fixture outside those roots.
+        #[cfg(unix)]
+        let parent = std::path::PathBuf::from("/var/tmp");
+        #[cfg(not(unix))]
+        let parent = std::env::temp_dir();
+        let tmp_dir = TmpDir::new_in(&parent);
         std::fs::create_dir(tmp_dir.path.join("temp")).unwrap();
         std::fs::create_dir(tmp_dir.path.join("temp-suffix")).unwrap();
 

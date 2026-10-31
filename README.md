@@ -6,6 +6,9 @@ terminal emulator from Zig to Rust (reference revision `93967b7`).
 Source imported from [ghrossty](https://github.com/vestergaardtechnology/ghrossty)
 at revision `22c6649679632701e7f6386c8825a1bc21a0a578`.
 
+This checkout includes bulk terminal-write optimizations and portable terminal
+tests. Its public C API headers are unchanged.
+
 ![The Rust port running as a GTK terminal](docs/screenshot-gtk.png)
 
 Every `ghostty/src/**/*.zig` (and `ghostty/pkg/**/*.zig`) file has a Rust
@@ -80,6 +83,28 @@ another installed libghostty-vt, e.g. Zig's, for comparison). The Zig API
 examples are Rust examples of the crate's API:
 `cargo run --example vt`, `cargo run --example vt_stream`,
 `printf '\e[31mred\n' | cargo run --example formatter`.
+
+## Terminal library and tests on macOS
+
+Build the standalone static library without app dependencies:
+
+```sh
+GHOSTTY_LIB_VT=1 CARGO_TARGET_DIR=target/lib-vt \
+  cargo rustc --release --no-default-features --lib --crate-type staticlib
+```
+
+The archive is `target/lib-vt/release/libghostty.a`. The existing
+`tools/build_lib_vt.sh` packaging script targets Linux/ELF.
+
+The terminal test target includes app code and needs the static gettext
+archive on macOS. With the app build dependencies and gettext installed:
+
+```sh
+RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$(brew --prefix gettext)/lib/libintl.a -l dylib=iconv -C link-arg=-framework -C link-arg=CoreFoundation" \
+  cargo test --no-default-features --lib terminal::
+```
+
+Use the same link flags with `simd::vt::` to run the decoder tests.
 
 ## The macOS app
 

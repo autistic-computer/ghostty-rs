@@ -153,6 +153,11 @@ pub mod standin {
     unsafe impl Sync for App {}
 
     impl App {
+        #[cfg(all(test, target_os = "macos"))]
+        pub fn keyboard_layout(&self) -> crate::input::KeyboardLayout {
+            crate::input::KeyboardLayout::Unknown
+        }
+
         /// Wake up the app event loop so it processes its mailbox.
         pub fn wakeup(&self) {
             self.wakeup_count.fetch_add(1, Ordering::Relaxed);
