@@ -22,10 +22,11 @@ differing lines of a value trace (compare.c's DIFF_TRACE). --minimize drops
 ops and write bytes while the case still fails the same way, then replays the
 result. --show prints a log as Python literals.
 
-known/ keeps minimized cases of bugs the port shares with upstream, so
-both engines agree on them: upstream-viewport-pin-integrity.bin trips the
+known/ keeps minimized cases of bugs both engines share, so
+both engines agree on them: shared-viewport-pin-integrity.bin trips the
 page list integrity check in debug builds of either engine (--checked), and
-upstream-insert-lines-livelock.bin never finishes on either.
+clone-insert-lines-livelock.bin never finishes on either (it writes to a
+screen clone, which is zz's addition, so the bug is in zz's clone code).
 """
 import concurrent.futures as cf, os, pathlib, random, re, shutil, signal, subprocess, sys, tempfile, time
 
