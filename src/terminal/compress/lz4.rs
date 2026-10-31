@@ -663,28 +663,31 @@ fn advance_search(ip: &mut usize, anchor: usize, attempts: &mut usize) {
 unsafe fn match_begin(input: &[u8], position: usize, candidate: usize, anchor: usize) -> (usize, usize) {
     debug_assert!(anchor <= position && position <= input.len() && candidate < position);
 
-    // The candidate trails by a fixed offset, so Zig's two bounds
-    // (`position > anchor`, `candidate > 0`) are one bound on `position`.
-    let offset = position - candidate;
-    let floor = anchor.max(offset);
     let mut position = position;
+    let mut candidate = candidate;
 
-    while position >= floor + 8 {
-        let word = position - 8;
-        // SAFETY: both words end at or before `position`, and word >= offset.
-        let difference = unsafe { load_u64(input, word) ^ load_u64(input, word - offset) };
+    while (position - anchor).min(candidate) >= 8 {
+        let position_word = position - 8;
+        let candidate_word = candidate - 8;
+        // SAFETY: both words end at or before `position`.
+        let difference = unsafe { load_u64(input, position_word) ^ load_u64(input, candidate_word) };
         if difference != 0 {
-            position -= (difference.leading_zeros() / 8) as usize;
-            return (position, position - offset);
+            let equal_bytes = (difference.leading_zeros() / 8) as usize;
+            position -= equal_bytes;
+            candidate -= equal_bytes;
+            return (position, candidate);
         }
-        position = word;
+
+        position = position_word;
+        candidate = candidate_word;
     }
 
-    // SAFETY: position > floor >= offset, so both indices are in bounds.
-    while position > floor && unsafe { load_u8(input, position - 1) == load_u8(input, position - 1 - offset) } {
+    // SAFETY: both indices are below `position`.
+    while position > anchor && candidate > 0 && unsafe { load_u8(input, position - 1) == load_u8(input, candidate - 1) } {
         position -= 1;
+        candidate -= 1;
     }
-    (position, position - offset)
+    (position, candidate)
 }
 
 /// Return the first input position where two matching runs differ, or `limit`
