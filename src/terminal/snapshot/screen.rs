@@ -1891,10 +1891,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        let old = std::mem::replace(&mut nd(node).data, NodeData::Compressed(compressed));
-        if let NodeData::Resident(mut page) = old {
-            page.deinit();
-        }
+        // The compressed page keeps the resident page's memory as its raw
+        // mapping, and the node still owns that pool item and frees it on
+        // teardown, so the resident page must not be freed here.
+        nd(node).data = NodeData::Compressed(compressed);
         assert_eq!(Storage::Compressed, nd(node).storage());
 
         let destination = encode_screen(&screen, TerminalScreenKey::Primary, b"");
