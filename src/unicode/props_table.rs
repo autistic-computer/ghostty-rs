@@ -23,3 +23,74 @@ pub static TABLE: Tables<'static, Properties> = Tables {
     stage2: &generated::STAGE2,
     stage3: &generated::STAGE3,
 };
+
+/// The width every codepoint of each 64-codepoint chunk of planes 0 and 1
+/// shares (the chunk is `cp >> 6`), or 0 when the chunk mixes widths.
+///
+/// Deviation (not in Zig): the batched print path checks this before the
+/// three-level lookup. Most text, CJK ideographs and most emoji included,
+/// sits in chunks of a single width, so one load answers what three
+/// dependent loads would. Chunks are small enough that the Greek and
+/// Cyrillic letters are not mixed in with their combining marks.
+pub static CHUNK_WIDTH: [u8; CHUNKS] = chunk_widths();
+
+/// Number of chunks in CHUNK_WIDTH: planes 0 and 1.
+pub const CHUNKS: usize = 0x20000 >> CHUNK_SHIFT;
+const CHUNK_SHIFT: u32 = 6;
+
+const fn chunk_widths() -> [u8; CHUNKS] {
+    const BLOCK: usize = 256;
+    const CHUNK: usize = 1 << CHUNK_SHIFT;
+    const PER_BLOCK: usize = BLOCK / CHUNK;
+    let stage1 = &generated::STAGE1;
+    let stage2 = &generated::STAGE2;
+    let stage3 = &generated::STAGE3;
+
+    // Stage 1 points at whole blocks of stage 2, so each distinct chunk of
+    // stage 2 is checked once and shared by every chunk that maps to it.
+    const STAGE2_CHUNKS: usize = generated::STAGE2.len() / CHUNK;
+    let mut shared = [0u8; STAGE2_CHUNKS];
+    let mut c = 0;
+    while c < STAGE2_CHUNKS {
+        let width = stage3[stage2[c * CHUNK] as usize].width;
+        let mut uniform = true;
+        let mut j = 1;
+        while j < CHUNK {
+            if stage3[stage2[c * CHUNK + j] as usize].width != width {
+                uniform = false;
+                break;
+            }
+            j += 1;
+        }
+        shared[c] = if uniform { width } else { 0 };
+        c += 1;
+    }
+
+    let mut out = [0u8; CHUNKS];
+    let mut i = 0;
+    while i < CHUNKS {
+        let base = stage1[i / PER_BLOCK] as usize;
+        assert!(base % BLOCK == 0 && base + BLOCK <= stage2.len());
+        out[i] = shared[base / CHUNK + i % PER_BLOCK];
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_width_matches_table() {
+        for chunk in 0..CHUNKS as u32 {
+            let width = CHUNK_WIDTH[chunk as usize];
+            let first = TABLE.get(chunk << CHUNK_SHIFT).width;
+            let uniform = (0..1 << CHUNK_SHIFT).all(|low| TABLE.get(chunk << CHUNK_SHIFT | low).width == first);
+            assert_eq!(if uniform { first } else { 0 }, width, "chunk {chunk:#x}");
+        }
+        // CJK ideographs are wide, Greek letters narrow.
+        assert_eq!(2, CHUNK_WIDTH[0x4E00 >> CHUNK_SHIFT]);
+        assert_eq!(1, CHUNK_WIDTH[0x3B1 >> CHUNK_SHIFT]);
+    }
+}

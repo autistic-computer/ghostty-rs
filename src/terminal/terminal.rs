@@ -604,11 +604,116 @@ const fn print_slice_cells_per_cp(wide: bool) -> usize {
 #[inline(always)]
 fn print_slice_eligible<const WIDE: bool>(cp: u32) -> bool {
     debug_assert!(cp > 0xFF);
-    if build_options::KITTY_GRAPHICS && cp == kitty::graphics::unicode::PLACEHOLDER {
+    let width = if WIDE { 2 } else { 1 };
+
+    // Deviation: check the chunk's shared width first (see CHUNK_WIDTH).
+    // The Kitty placeholder is outside the chunks, so only the table
+    // lookup needs to rule it out.
+    match unicode::props_table::CHUNK_WIDTH.get((cp >> 6) as usize) {
+        Some(&shared) if shared != 0 => shared == width,
+        _ => {
+            if build_options::KITTY_GRAPHICS && cp == kitty::graphics::unicode::PLACEHOLDER {
+                return false;
+            }
+            unicode::TABLE.get(cp).width == width
+        }
+    }
+}
+
+/// Runs of at most this many cells are filled cell by cell.
+const PRINT_SLICE_SHORT_CELLS: usize = 8;
+
+/// The width print() gives a codepoint above 0xFF (Zig:
+/// `unicode.table.get(cp).width`), checking the chunk's shared width
+/// first (see CHUNK_WIDTH).
+#[inline(always)]
+fn print_slice_width(cp: u32) -> u8 {
+    match unicode::props_table::CHUNK_WIDTH.get((cp >> 6) as usize) {
+        Some(&shared) if shared != 0 => shared,
+        _ => unicode::TABLE.get(cp).width,
+    }
+}
+
+/// Whether `cp`, printed right after `prev` was written as a fresh
+/// single-codepoint cell, can be batched in the given width class.
+#[inline(always)]
+fn print_slice_continues<const WIDE: bool>(prev: u32, cp: u32, grapheme_cluster: bool, allow_unicode: bool) -> bool {
+    if !WIDE && (0x10..=0xFF).contains(&cp) {
+        return true;
+    }
+    if !(cp > 0xFF && allow_unicode && print_slice_eligible::<WIDE>(cp)) {
         return false;
     }
+    if !grapheme_cluster {
+        return true;
+    }
+    let mut state = BreakState::default();
+    unicode::grapheme_break(prev, cp, &mut state)
+}
 
-    unicode::TABLE.get(cp).width == if WIDE { 2 } else { 1 }
+/// The end of the run of codepoints from `start` that we can batch in one
+/// width class. The codepoint at `start` must already be eligible. For
+/// codepoints after the first, the previous codepoint in the run is always
+/// written as a fresh, single-codepoint cell, so the grapheme break check
+/// against it is exact.
+#[inline(always)]
+fn print_slice_run_end(cps: &[u32], start: usize, wide: bool, grapheme_cluster: bool, allow_unicode: bool) -> usize {
+    if wide {
+        print_slice_run_end_::<true>(cps, start, grapheme_cluster, allow_unicode)
+    } else {
+        print_slice_run_end_::<false>(cps, start, grapheme_cluster, allow_unicode)
+    }
+}
+
+#[inline(always)]
+fn print_slice_run_end_<const WIDE: bool>(
+    cps: &[u32],
+    start: usize,
+    grapheme_cluster: bool,
+    allow_unicode: bool,
+) -> usize {
+    let mut idx: usize = start + 1;
+    if !WIDE {
+        // Check a full group without short-circuiting so the compiler
+        // can vectorize the common narrow run. The scalar loop below
+        // locates the first exception and handles Unicode as before.
+        for group in cps[idx..].chunks_exact(4) {
+            let narrow = group.iter().fold(true, |all, &cp| all & (0x10..=0xFF).contains(&cp));
+            if !narrow {
+                break;
+            }
+            idx += 4;
+        }
+    }
+    // The mode checks are hoisted so the common loops stay small.
+    if !allow_unicode {
+        while !WIDE && idx < cps.len() && (0x10..=0xFF).contains(&cps[idx]) {
+            idx += 1;
+        }
+        return idx;
+    }
+    if !grapheme_cluster {
+        while idx < cps.len() {
+            let cp = cps[idx];
+            let batch = if WIDE {
+                cp > 0xFF && print_slice_eligible::<true>(cp)
+            } else {
+                (0x10..=0xFF).contains(&cp) || (cp > 0xFF && print_slice_eligible::<false>(cp))
+            };
+            if !batch {
+                return idx;
+            }
+            idx += 1;
+        }
+        return idx;
+    }
+    while idx < cps.len() {
+        if !print_slice_continues::<WIDE>(cps[idx - 1], cps[idx], grapheme_cluster, allow_unicode) {
+            return idx;
+        }
+        idx += 1;
+    }
+    cps.len()
 }
 
 /// The bit position of the `content` field within the packed
@@ -655,12 +760,79 @@ fn print_slice_store_run(
         return;
     }
 
-    for idx in from..to {
-        // SAFETY: idx < cell_count, within the cursor row.
+    // Zipping two slices leaves no bounds check in the loop, so it
+    // vectorizes (Zig vectorizes this loop by hand).
+    // SAFETY: [from, to) is within the cursor row, and Cell is a
+    // transparent u64.
+    let dst = unsafe { std::slice::from_raw_parts_mut(cells.add(from) as *mut u64, to - from) };
+    for (d, &cp) in dst.iter_mut().zip(&cps[from..to]) {
+        *d = template_bits | ((cp as u64) << CP_SHIFT);
+    }
+}
+
+/// Stores (wide, spacer tail) cell pairs for `cps`, starting at `cells`.
+#[inline(always)]
+fn print_slice_store_wide_run(cells: *mut Cell, cps: &[u32], wide_bits: u64, spacer_bits: u64) {
+    debug_assert!(wide_bits & cell_fields::CONTENT.mask() == 0);
+    // SAFETY: the caller checked that 2 * cps.len() cells from `cells` are
+    // in the cursor row. Cell is a transparent u64, so a pair is [u64; 2].
+    let dst = unsafe { std::slice::from_raw_parts_mut(cells as *mut [u64; 2], cps.len()) };
+    for (pair, &cp) in dst.iter_mut().zip(cps) {
+        *pair = [wide_bits | ((cp as u64) << CP_SHIFT), spacer_bits];
+    }
+}
+
+/// The end of the run of cells in [from, to) whose SimpleMask bits equal
+/// `expected` (Zig: `SimpleMask.eqlPrefix` over groups, then scalar).
+///
+/// Deviation: on x86_64 this compares two cells per SSE2 register, since
+/// without a 64-bit lane compare the group compare stays scalar there.
+#[inline(always)]
+fn print_slice_simple_end(cells: *const Cell, from: usize, to: usize, expected: u64) -> usize {
+    let mut i = from;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is part of the x86_64 baseline. Every load reads
+        // cells [i, i + 4) with i + 4 <= to, inside the cursor row.
         unsafe {
-            *cells.add(idx) = Cell::from_bits(template_bits | ((cps[idx] as u64) << CP_SHIFT));
+            let mask = _mm_set1_epi64x(SIMPLE_MASK_BITS as i64);
+            let want = _mm_set1_epi64x(expected as i64);
+            while i + 4 <= to {
+                let a = _mm_loadu_si128(cells.add(i) as *const __m128i);
+                let b = _mm_loadu_si128(cells.add(i + 2) as *const __m128i);
+                // A cell matches when both of its 32-bit halves do.
+                let ea = _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_and_si128(a, mask), want)) as u32;
+                let eb = _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_and_si128(b, mask), want)) as u32;
+                let eq = ea | eb << 16;
+                if eq != u32::MAX {
+                    return i + ((!eq).trailing_zeros() / 8) as usize;
+                }
+                i += 4;
+            }
         }
     }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let group_len = SimpleMask::GROUP_LEN;
+        // SAFETY: [from, to) is within the cursor row.
+        let view = unsafe { std::slice::from_raw_parts(cells, to) };
+        while i + group_len <= to {
+            let p = SimpleMask::eql_prefix(view, i, expected);
+            i += p;
+            if p != group_len {
+                return i;
+            }
+        }
+    }
+
+    // SAFETY: i < to, inside the cursor row.
+    while i < to && SimpleMask::eql_scalar(unsafe { *cells.add(i) }, expected) {
+        i += 1;
+    }
+    i
 }
 
 /// The expected value of a simple cell (per SimpleMask in
@@ -1258,7 +1430,7 @@ impl Terminal {
             // Try the fast-path print first. This will return the number of
             // codepoints it consumed.
             let consumed = if ASCII {
-                self.print_slice_fill::<false, true>(&cps[i..], grapheme_cluster, allow_unicode)?
+                self.print_slice_fill::<true>(&cps[i..], grapheme_cluster, allow_unicode, false)?
             } else {
                 self.print_slice_fast(&cps[i..], grapheme_cluster, allow_unicode)?
             };
@@ -1319,7 +1491,7 @@ impl Terminal {
             if cp0 < 0x10 {
                 return Ok(0);
             }
-            return self.print_slice_fill::<false, false>(cps, grapheme_cluster, allow_unicode);
+            return self.print_slice_fill::<false>(cps, grapheme_cluster, allow_unicode, false);
         }
 
         if !allow_unicode {
@@ -1385,23 +1557,31 @@ impl Terminal {
         // specialized at comptime by width class, so this switch selects
         // between the two instantiations rather than passing the width
         // through as an argument.
-        match unicode::TABLE.get(cp0).width {
-            1 => self.print_slice_fill::<false, false>(cps, grapheme_cluster, allow_unicode),
-            2 => self.print_slice_fill::<true, false>(cps, grapheme_cluster, allow_unicode),
+        match print_slice_width(cp0) {
+            1 => self.print_slice_fill::<false>(cps, grapheme_cluster, allow_unicode, false),
+            2 => self.print_slice_fill::<false>(cps, grapheme_cluster, allow_unicode, true),
             _ => Ok(0),
         }
     }
 
-    /// The row-filling portion of the printSlice fast path, specialized by
-    /// width class. The first codepoint must already be validated by the
-    /// caller (printSliceFast).
-    fn print_slice_fill<const WIDE: bool, const ASCII: bool>(
+    /// The row-filling portion of the printSlice fast path. The first
+    /// codepoint must already be validated by the caller (printSliceFast)
+    /// for the width class `wide`.
+    ///
+    /// Deviation: Zig specializes this function by width class and returns
+    /// to printSlice whenever the class changes. Here one call keeps filling
+    /// the row with the other class when the next codepoint belongs to it, so
+    /// text that mixes wide and narrow codepoints (CJK or emoji among Latin)
+    /// sets up each row once instead of once per run. The run scans and cell
+    /// stores stay specialized by class.
+    fn print_slice_fill<const ASCII: bool>(
         &mut self,
         cps: &[u32],
         grapheme_cluster: bool,
         allow_unicode: bool,
+        wide: bool,
     ) -> Result<usize, IncreaseCapacityError> {
-        let r = self.print_slice_fill_::<WIDE, ASCII>(cps, grapheme_cluster, allow_unicode);
+        let r = self.print_slice_fill_::<ASCII>(cps, grapheme_cluster, allow_unicode, wide);
 
         // After doing any printing, wrapping, scrolling, etc. we want to
         // ensure that our screen remains in a consistent state.
@@ -1409,11 +1589,12 @@ impl Terminal {
         r
     }
 
-    fn print_slice_fill_<const WIDE: bool, const ASCII: bool>(
+    fn print_slice_fill_<const ASCII: bool>(
         &mut self,
         cps: &[u32],
         grapheme_cluster: bool,
         allow_unicode: bool,
+        wide: bool,
     ) -> Result<usize, IncreaseCapacityError> {
         let mut screen = self.screens.active;
         let charset_table: Option<&'static [u16]> = match screen.charset.charsets.get(screen.charset.gl) {
@@ -1422,58 +1603,30 @@ impl Terminal {
         };
         debug_assert!(charset_table.is_none() || !allow_unicode);
 
-        // Determine the run of codepoints in the same width class that we
-        // can batch. For codepoints after the first, the previous codepoint
-        // in the run is always written as a fresh, single-codepoint cell,
-        // so the grapheme break check against it is exact.
-        let run_len: usize = 'run: {
-            if ASCII {
-                break 'run cps.len();
-            }
-            let mut idx: usize = 1;
-            if !WIDE {
-                // Check a full group without short-circuiting so the compiler
-                // can vectorize the common narrow run. The scalar loop below
-                // locates the first exception and handles Unicode as before.
-                for group in cps[1..].chunks_exact(4) {
-                    let narrow = group.iter().fold(true, |all, &cp| {
-                        all & (0x10..=0xFF).contains(&cp)
-                    });
-                    if !narrow {
-                        break;
-                    }
-                    idx += 4;
-                }
-            }
-            while idx < cps.len() {
-                let cp = cps[idx];
-                if !WIDE && (0x10..=0xFF).contains(&cp) {
-                    idx += 1;
-                    continue;
-                }
-                if cp > 0xFF && allow_unicode && print_slice_eligible::<WIDE>(cp) {
-                    if !grapheme_cluster {
-                        idx += 1;
-                        continue;
-                    }
-                    let mut state = BreakState::default();
-                    if unicode::grapheme_break(cps[idx - 1], cp, &mut state) {
-                        idx += 1;
-                        continue;
-                    }
-                }
-                break 'run idx;
-            }
+        // The width class of the current run and the run's end: the
+        // codepoints we can batch in that class.
+        let mut wide = !ASCII && wide;
+        let mut run_end = if ASCII {
             cps.len()
+        } else {
+            print_slice_run_end(cps, 0, wide, grapheme_cluster, allow_unicode)
         };
-        debug_assert!(run_len > 0);
+        debug_assert!(run_end > 0);
 
-        // The number of cells each codepoint occupies.
-        let cells_per_cp: usize = print_slice_cells_per_cp(WIDE);
         let group_len = SimpleMask::GROUP_LEN;
 
+        /// How filling a row ended.
+        enum RowEnd {
+            /// The row is full and the next codepoint goes on the next row.
+            Full,
+            /// The next codepoint or cell needs print().
+            Stop,
+            /// A wide codepoint is next and one cell is left in the row.
+            SpacerHead,
+        }
+
         let mut printed: usize = 0;
-        'outer: while printed < run_len {
+        while printed < run_end {
             // If we're soft-wrapping, handle that first so that our cursor
             // is in the row/column that will receive the next codepoint.
             if screen.cursor.pending_wrap {
@@ -1488,19 +1641,13 @@ impl Terminal {
                 self.scrolling_region.right as usize + 1
             };
 
-            // A degenerate 1-wide region can't hold a wide char; print()
-            // has special handling so fall back to it.
-            if WIDE && right_limit - self.scrolling_region.left as usize <= 1 {
-                break;
-            }
-
             let avail: usize = right_limit - screen.cursor.x as usize;
             debug_assert!(avail > 0);
 
             // The cursor caches live row and cell pointers into this mapping, so
             // its page cannot be compressed while this print path is active.
             let page = nd(tp(screen.cursor.page_pin).node).page_assume_resident();
-            let cells: *mut Cell = screen.cursor.page_cell;
+            let row_cells: *mut Cell = screen.cursor.page_cell;
             let row = rw(screen.cursor.page_row);
             let style_id = screen.cursor.style_id;
             let template: Cell = {
@@ -1514,34 +1661,6 @@ impl Terminal {
             let template_bits: u64 = template.to_bits();
             let check_expected: u64 = print_slice_check_expected(style_id);
 
-            if WIDE && avail == 1 {
-                // Only one cell left in the row: print() writes a
-                // spacer head (or a blank narrow cell if we're inside
-                // a right margin) and wraps. We require a simple cell,
-                // otherwise fall back to print() for the cleanup.
-                if !SimpleMask::eql_scalar(*cl(cells), check_expected) {
-                    break;
-                }
-
-                let mut spacer = template;
-                if right_limit == self.cols as usize {
-                    row.set_wrap(true);
-                    spacer.set_wide(Wide::SpacerHead);
-                }
-                row.set_dirty(true);
-                if style_id != style::DEFAULT_ID {
-                    row.set_styled(true);
-                }
-                *cl(cells) = spacer;
-                self.print_wrap()?;
-                continue 'outer;
-            }
-
-            // Number of codepoints and cells we're writing to this row.
-            let count = (avail / cells_per_cp).min(run_len - printed);
-            debug_assert!(count > 0);
-            let cell_count = count * cells_per_cp;
-
             // Wide cells always come in (wide, spacer_tail) pairs.
             let spacer_bits: u64 = {
                 let mut spacer = template;
@@ -1554,184 +1673,279 @@ impl Terminal {
                 w.to_bits()
             };
 
-            // A read-only view of the cells being written (for the masked
-            // group compares). Recreated for each use so it never overlaps
-            // a write.
-            let view = || -> &[Cell] {
-                // SAFETY: cell_count cells starting at the cursor fit in the row.
-                unsafe { std::slice::from_raw_parts(cells, cell_count) }
-            };
-            let run_cps = &cps[printed..];
+            // Fill the row with runs of one width class each. `col` counts
+            // the cells written to this row, from the cursor.
+            let mut col: usize = 0;
+            let row_end: RowEnd = 'row: loop {
+                // The number of cells each codepoint occupies.
+                let cells_per_cp: usize = print_slice_cells_per_cp(wide);
 
-            let mut k: usize = 0; // cells written
-            'fill: while k < cell_count {
-                // Find the run of simple cells so the store loop below is
-                // branch-free (and vectorizable). This is an early-exit
-                // search loop, and reused rows typically match the whole
-                // way through, so scan several cells at a time.
-                let mut simple = k;
-                'simple: {
-                    while simple + group_len <= cell_count {
-                        let p = SimpleMask::eql_prefix(view(), simple, check_expected);
-                        simple += p;
-                        if p != group_len {
-                            break 'simple;
-                        }
+                if wide {
+                    // A degenerate 1-wide region can't hold a wide char; print()
+                    // has special handling so fall back to it.
+                    if right_limit - self.scrolling_region.left as usize <= 1 {
+                        break 'row RowEnd::Stop;
                     }
-                    while simple < cell_count {
-                        if !SimpleMask::eql_scalar(*cl(cells.wrapping_add(simple)), check_expected) {
-                            break;
-                        }
-                        simple += 1;
+                    if avail - col == 1 {
+                        break 'row RowEnd::SpacerHead;
                     }
                 }
 
-                if WIDE {
-                    // We can only write whole (wide, spacer) pairs.
-                    let pair_end = k + (simple - k) / 2 * 2;
-                    let mut idx = k;
-                    while idx < pair_end {
-                        // SAFETY: idx + 1 < cell_count.
-                        unsafe {
-                            *cells.add(idx) = Cell::from_bits(wide_bits | ((run_cps[idx / 2] as u64) << CP_SHIFT));
-                            *cells.add(idx + 1) = Cell::from_bits(spacer_bits);
-                        }
-                        idx += 2;
-                    }
+                // Number of codepoints and cells we're writing to this row.
+                let count = ((avail - col) >> (wide as usize)).min(run_end - printed);
+                debug_assert!(count > 0);
+                let cell_count = count * cells_per_cp;
+                let cells: *mut Cell = row_cells.wrapping_add(col);
 
-                    // If the simple run ended mid-pair we stop at the pair
-                    // boundary and handle the offending cell below.
-                    k = pair_end;
-                } else {
-                    print_slice_store_run(cells, run_cps, k, simple, template_bits, charset_table);
-                    k = simple;
-                }
-                if k >= cell_count {
-                    break;
-                }
+                // A read-only view of the cells being written (for the masked
+                // group compares). Recreated for each use so it never overlaps
+                // a write.
+                let view = || -> &[Cell] {
+                    // SAFETY: cell_count cells starting at `cells` fit in the row.
+                    unsafe { std::slice::from_raw_parts(cells, cell_count) }
+                };
+                let run_cps = &cps[printed..];
 
-                // Bulk path for runs of cells that differ from the
-                // expected simple cell only by their style: this is the
-                // common case when styled text overwrites previously
-                // styled (or default-styled) rows, e.g. TUI redraws.
-                // These runs are handled wholesale: one scan to find the
-                // run of identical old styles, two ref-count updates,
-                // and a branch-free fill.
-                if !WIDE {
-                    'bulk: {
-                        let first = SimpleMask::pattern(*cl(cells.wrapping_add(k)));
-
-                        // The old cell must be a plain narrow codepoint cell
-                        // with no hyperlink whose only difference is the
-                        // style id (see printSliceCheckExpected: every other
-                        // masked field must be zero).
-                        let style_shift = cell_fields::STYLE_ID.offset;
-                        let old_style: style::Id = (first >> style_shift) as style::Id;
-                        if first != print_slice_check_expected(old_style) {
-                            break 'bulk;
-                        }
-                        debug_assert!(old_style != style_id); // it failed the simple check
-
-                        // Find the run of cells with identical masked bits.
-                        let mut m = k + 1;
-                        'scan: {
-                            while m + group_len <= cell_count {
-                                let p = SimpleMask::eql_prefix(view(), m, first);
-                                m += p;
-                                if p != group_len {
-                                    break 'scan;
-                                }
-                            }
-                            while m < cell_count {
-                                if !SimpleMask::eql_scalar(*cl(cells.wrapping_add(m)), first) {
+                let mut k: usize = 0; // cells written
+                'fill: while k < cell_count {
+                    if cell_count - k <= PRINT_SLICE_SHORT_CELLS {
+                        // Deviation: a few cells are checked and written one
+                        // at a time, which costs less than setting up the
+                        // scan and the vector store below. Mixed text is
+                        // mostly short runs.
+                        while k < cell_count {
+                            // SAFETY: k (and k + 1 for a wide pair) < cell_count.
+                            let simple = |at: usize| SimpleMask::eql_scalar(unsafe { *cells.add(at) }, check_expected);
+                            if wide {
+                                if !(simple(k) && simple(k + 1)) {
                                     break;
                                 }
-                                m += 1;
+                                let cp = run_cps[k >> 1];
+                                // SAFETY: as above.
+                                unsafe {
+                                    *cells.add(k) = Cell::from_bits(wide_bits | ((cp as u64) << CP_SHIFT));
+                                    *cells.add(k + 1) = Cell::from_bits(spacer_bits);
+                                }
+                                k += 2;
+                            } else {
+                                if !simple(k) {
+                                    break;
+                                }
+                                let cp = match charset_table {
+                                    Some(table) => table[run_cps[k] as usize] as u32,
+                                    None => run_cps[k],
+                                };
+                                // SAFETY: as above.
+                                unsafe { *cells.add(k) = Cell::from_bits(template_bits | ((cp as u64) << CP_SHIFT)) };
+                                k += 1;
                             }
                         }
+                    } else if wide {
+                        // Find the run of simple cells so the store loop below is
+                        // branch-free (and vectorizable). This is an early-exit
+                        // search loop, and reused rows typically match the whole
+                        // way through, so scan several cells at a time.
+                        let simple = print_slice_simple_end(cells, k, cell_count, check_expected);
+                        // We can only write whole (wide, spacer) pairs.
+                        let pair_end = k + (simple - k) / 2 * 2;
+                        print_slice_store_wide_run(
+                            cells.wrapping_add(k),
+                            &run_cps[k / 2..pair_end / 2],
+                            wide_bits,
+                            spacer_bits,
+                        );
 
-                        // Fix up the style ref counts for the whole run at
-                        // once. Each of the old cells held a reference to
-                        // old_style so the release is safe by construction.
-                        let n = m - k;
-                        if old_style != style::DEFAULT_ID {
-                            // SAFETY: the style is in this page's set.
-                            unsafe { page.styles.release_multiple(page.memory, old_style, n as _) };
-                        }
-                        if style_id != style::DEFAULT_ID {
-                            // SAFETY: the style is in this page's set.
-                            unsafe { page.styles.use_multiple(page.memory, style_id, n as _) };
-                        }
-
-                        print_slice_store_run(cells, run_cps, k, m, template_bits, charset_table);
-                        k = m;
-                        continue 'fill;
+                        // If the simple run ended mid-pair we stop at the pair
+                        // boundary and handle the offending cell below.
+                        k = pair_end;
+                    } else {
+                        let simple = print_slice_simple_end(cells, k, cell_count, check_expected);
+                        print_slice_store_run(cells, run_cps, k, simple, template_bits, charset_table);
+                        k = simple;
                     }
+                    if k >= cell_count {
+                        break;
+                    }
+
+                    // Bulk path for runs of cells that differ from the
+                    // expected simple cell only by their style: this is the
+                    // common case when styled text overwrites previously
+                    // styled (or default-styled) rows, e.g. TUI redraws.
+                    // These runs are handled wholesale: one scan to find the
+                    // run of identical old styles, two ref-count updates,
+                    // and a branch-free fill.
+                    if !wide {
+                        'bulk: {
+                            let first = SimpleMask::pattern(*cl(cells.wrapping_add(k)));
+
+                            // The old cell must be a plain narrow codepoint cell
+                            // with no hyperlink whose only difference is the
+                            // style id (see printSliceCheckExpected: every other
+                            // masked field must be zero).
+                            let style_shift = cell_fields::STYLE_ID.offset;
+                            let old_style: style::Id = (first >> style_shift) as style::Id;
+                            if first != print_slice_check_expected(old_style) {
+                                break 'bulk;
+                            }
+                            debug_assert!(old_style != style_id); // it failed the simple check
+
+                            // Find the run of cells with identical masked bits.
+                            let mut m = k + 1;
+                            'scan: {
+                                while m + group_len <= cell_count {
+                                    let p = SimpleMask::eql_prefix(view(), m, first);
+                                    m += p;
+                                    if p != group_len {
+                                        break 'scan;
+                                    }
+                                }
+                                while m < cell_count {
+                                    if !SimpleMask::eql_scalar(*cl(cells.wrapping_add(m)), first) {
+                                        break;
+                                    }
+                                    m += 1;
+                                }
+                            }
+
+                            // Fix up the style ref counts for the whole run at
+                            // once. Each of the old cells held a reference to
+                            // old_style so the release is safe by construction.
+                            let n = m - k;
+                            if old_style != style::DEFAULT_ID {
+                                // SAFETY: the style is in this page's set.
+                                unsafe { page.styles.release_multiple(page.memory, old_style, n as _) };
+                            }
+                            if style_id != style::DEFAULT_ID {
+                                // SAFETY: the style is in this page's set.
+                                unsafe { page.styles.use_multiple(page.memory, style_id, n as _) };
+                            }
+
+                            print_slice_store_run(cells, run_cps, k, m, template_bits, charset_table);
+                            k = m;
+                            continue 'fill;
+                        }
+                    }
+
+                    // General path for cells that failed the masked check:
+                    // style-only mismatches are handled inline; anything that
+                    // needs cleanup (wide chars and their spacers, grapheme
+                    // data, hyperlinks) falls back to print().
+                    let general_count: usize = cells_per_cp;
+                    for offset in 0..general_count {
+                        let cell = cl(cells.wrapping_add(k + offset));
+                        if cell.wide() != Wide::Narrow || cell.has_grapheme() || cell.hyperlink() {
+                            break 'fill;
+                        }
+                    }
+                    for offset in 0..general_count {
+                        let cell = cl(cells.wrapping_add(k + offset));
+                        if cell.style_id() != style_id {
+                            if cell.style_id() != style::DEFAULT_ID {
+                                // SAFETY: the style is in this page's set.
+                                unsafe { page.styles.release(page.memory, cell.style_id()) };
+                            }
+                            if style_id != style::DEFAULT_ID {
+                                // SAFETY: the style is in this page's set.
+                                unsafe { page.styles.use_(page.memory, style_id) };
+                            }
+                        }
+                    }
+                    if wide {
+                        *cl(cells.wrapping_add(k)) = Cell::from_bits(wide_bits | ((run_cps[k / 2] as u64) << CP_SHIFT));
+                        *cl(cells.wrapping_add(k + 1)) = Cell::from_bits(spacer_bits);
+                    } else {
+                        let cp = match charset_table {
+                            Some(table) => table[run_cps[k] as usize] as u32,
+                            None => run_cps[k],
+                        };
+                        *cl(cells.wrapping_add(k)) = Cell::from_bits(template_bits | ((cp as u64) << CP_SHIFT));
+                    }
+                    k += cells_per_cp;
                 }
 
-                // General path for cells that failed the masked check:
-                // style-only mismatches are handled inline; anything that
-                // needs cleanup (wide chars and their spacers, grapheme
-                // data, hyperlinks) falls back to print().
-                let general_count: usize = cells_per_cp;
-                for offset in 0..general_count {
-                    let cell = cl(cells.wrapping_add(k + offset));
-                    if cell.wide() != Wide::Narrow || cell.has_grapheme() || cell.hyperlink() {
-                        break 'fill;
-                    }
-                }
-                for offset in 0..general_count {
-                    let cell = cl(cells.wrapping_add(k + offset));
-                    if cell.style_id() != style_id {
-                        if cell.style_id() != style::DEFAULT_ID {
-                            // SAFETY: the style is in this page's set.
-                            unsafe { page.styles.release(page.memory, cell.style_id()) };
-                        }
-                        if style_id != style::DEFAULT_ID {
-                            // SAFETY: the style is in this page's set.
-                            unsafe { page.styles.use_(page.memory, style_id) };
-                        }
-                    }
-                }
-                if WIDE {
-                    *cl(cells.wrapping_add(k)) = Cell::from_bits(wide_bits | ((run_cps[k / 2] as u64) << CP_SHIFT));
-                    *cl(cells.wrapping_add(k + 1)) = Cell::from_bits(spacer_bits);
-                } else {
-                    let cp = match charset_table {
-                        Some(table) => table[run_cps[k] as usize] as u32,
-                        None => run_cps[k],
-                    };
-                    *cl(cells.wrapping_add(k)) = Cell::from_bits(template_bits | ((cp as u64) << CP_SHIFT));
-                }
-                k += cells_per_cp;
-            }
-
-            if k > 0 {
                 debug_assert!(k % cells_per_cp == 0);
+                col += k;
+                printed += k >> (wide as usize);
+
+                // We hit a cell that requires the slow path.
+                if k < cell_count {
+                    break 'row RowEnd::Stop;
+                }
+                // The run continues on the next row.
+                if printed < run_end {
+                    break 'row RowEnd::Full;
+                }
+
+                // The run ended. Continue with the other width class when the
+                // next codepoint belongs to it. The previous codepoint was just
+                // written as a fresh cell, so the grapheme break check against
+                // it is exact, as within a run.
+                if ASCII || printed == cps.len() {
+                    break 'row RowEnd::Stop;
+                }
+                let (prev, next) = (cps[printed - 1], cps[printed]);
+                let other = if wide {
+                    print_slice_continues::<false>(prev, next, grapheme_cluster, allow_unicode)
+                } else {
+                    print_slice_continues::<true>(prev, next, grapheme_cluster, allow_unicode)
+                };
+                if !other {
+                    break 'row RowEnd::Stop;
+                }
+                wide = !wide;
+                run_end = print_slice_run_end(cps, printed, wide, grapheme_cluster, allow_unicode);
+                if col == avail {
+                    break 'row RowEnd::Full;
+                }
+            };
+
+            if col > 0 {
                 row.set_dirty(true);
                 if style_id != style::DEFAULT_ID {
                     row.set_styled(true);
                 }
-                self.previous_char = Some(cps[printed + k / cells_per_cp - 1]);
-                printed += k / cells_per_cp;
+                self.previous_char = Some(cps[printed - 1]);
 
                 // Advance the cursor. If we filled through the right limit
                 // then the cursor stays on the last cell with the pending
                 // wrap flag set, matching print().
-                if screen.cursor.x as usize + k >= right_limit {
-                    debug_assert!(screen.cursor.x as usize + k == right_limit);
-                    screen.cursor_right((k - 1) as CellCountInt);
+                if screen.cursor.x as usize + col >= right_limit {
+                    debug_assert!(screen.cursor.x as usize + col == right_limit);
+                    screen.cursor_right((col - 1) as CellCountInt);
                     screen.cursor.pending_wrap = true;
                 } else {
-                    screen.cursor_right(k as CellCountInt);
+                    screen.cursor_right(col as CellCountInt);
                 }
             }
 
-            // We hit a cell that requires the slow path. The cursor is
-            // exactly at that cell so return and let the caller print the
-            // next codepoint via print().
-            if k < cell_count {
-                break;
+            match row_end {
+                RowEnd::Full => {}
+                // The cursor is exactly at the cell or codepoint that needs
+                // the slow path, so return and let the caller print the next
+                // codepoint via print().
+                RowEnd::Stop => break,
+                RowEnd::SpacerHead => {
+                    // Only one cell left in the row: print() writes a
+                    // spacer head (or a blank narrow cell if we're inside
+                    // a right margin) and wraps. We require a simple cell,
+                    // otherwise fall back to print() for the cleanup.
+                    let cell = screen.cursor.page_cell;
+                    if !SimpleMask::eql_scalar(*cl(cell), check_expected) {
+                        break;
+                    }
+
+                    let mut spacer = template;
+                    if right_limit == self.cols as usize {
+                        row.set_wrap(true);
+                        spacer.set_wide(Wide::SpacerHead);
+                    }
+                    row.set_dirty(true);
+                    if style_id != style::DEFAULT_ID {
+                        row.set_styled(true);
+                    }
+                    *cl(cell) = spacer;
+                    self.print_wrap()?;
+                }
             }
         }
 
@@ -15358,6 +15572,99 @@ mod tests {
         test_print_slice_differential(&mut rand, 500, 10, 4);
         test_print_slice_differential(&mut rand, 500, 5, 2);
         test_print_slice_differential(&mut rand, 200, 2, 2);
+    }
+
+    /// Long and short runs of each width class, switching class mid-row and
+    /// at row ends, must give the same cells (text, width, style), cursor
+    /// and wrap state with printSlice() as with print().
+    #[test]
+    fn terminal_printslice_class_switches_match_print() {
+        let classes: &[&[u32]] = &[
+            &['a' as u32, 'b' as u32, 'z' as u32, ' ' as u32, '~' as u32],
+            &[0xE9, 0xFF, 0xA0],
+            &[0x101, 0x3B1, 0x436, 0x15F, 0x2500, 0x600, 0x110BD],
+            &[0x4E00, 0x9FA5, 0xAC00, 0x3042, 0xFF21],
+            &[0x1F600, 0x1F680, 0x2705, 0x1F1E6],
+            &[0x301, 0x200D, 0xFE0F],
+        ];
+        let mut rand = TestPrng::init(0x5157_C4E5);
+        for &(cols, rows) in &[(7u16, 3u16), (8, 3), (13, 4), (40, 5), (121, 3)] {
+            let mut t1 = init(cols, rows);
+            let mut t2 = init(cols, rows);
+            let mut cps: Vec<u32> = Vec::new();
+            for _ in 0..400 {
+                match rand.int_range_at_most(0, 9) {
+                    0 => {
+                        let attr: sgr::Attribute<'static> = match rand.int_range_at_most(0, 2) {
+                            0 => sgr::Attribute::Unset,
+                            1 => sgr::Attribute::Bold,
+                            _ => sgr::Attribute::Fg8(color::Name::RED),
+                        };
+                        t1.set_attribute(attr).unwrap();
+                        t2.set_attribute(attr).unwrap();
+                    }
+                    1 => {
+                        let v = rand.boolean();
+                        t1.modes.set(Mode::GraphemeCluster, v);
+                        t2.modes.set(Mode::GraphemeCluster, v);
+                    }
+                    2 => {
+                        if rand.boolean() {
+                            t1.carriage_return();
+                            t2.carriage_return();
+                            t1.linefeed().unwrap();
+                            t2.linefeed().unwrap();
+                        } else {
+                            let row = rand.int_range_at_most(1, rows as u64) as usize;
+                            let col = rand.int_range_at_most(1, cols as u64) as usize;
+                            t1.set_cursor_pos(row, col);
+                            t2.set_cursor_pos(row, col);
+                        }
+                    }
+                    _ => {
+                        cps.clear();
+                        for _ in 0..rand.int_range_at_most(1, 6) {
+                            // Zero-width codepoints come one at a time.
+                            let class = classes[rand.int_range_less_than(0, classes.len() as u64) as usize];
+                            let len = if class[0] == 0x301 { 1 } else { rand.int_range_at_most(1, 40) };
+                            for _ in 0..len {
+                                cps.push(class[rand.int_range_less_than(0, class.len() as u64) as usize]);
+                            }
+                        }
+                        for &cp in &cps {
+                            t1.print(cp).unwrap();
+                        }
+                        t2.print_slice(&cps).unwrap();
+                    }
+                }
+
+                let (s1, s2) = (&t1.screens.active, &t2.screens.active);
+                assert_eq!(
+                    (s1.cursor.x, s1.cursor.y, s1.cursor.pending_wrap),
+                    (s2.cursor.x, s2.cursor.y, s2.cursor.pending_wrap),
+                    "cps: {cps:x?}"
+                );
+                for y in 0..rows as u32 {
+                    for x in 0..cols {
+                        let c1 = s1.pages.get_cell(act(x, y)).unwrap();
+                        let c2 = s2.pages.get_cell(act(x, y)).unwrap();
+                        let (a, b) = (cl(c1.cell), cl(c2.cell));
+                        assert_eq!(
+                            (a.codepoint(), a.wide(), a.has_grapheme(), c1.style() == c2.style()),
+                            (b.codepoint(), b.wide(), b.has_grapheme(), true),
+                            "cell {x},{y} cps: {cps:x?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    s1.dump_string_alloc(scr(0, 0)).unwrap(),
+                    s2.dump_string_alloc(scr(0, 0)).unwrap(),
+                    "cps: {cps:x?}"
+                );
+            }
+            cursor_page(t1.screens.active).verify_integrity().unwrap();
+            cursor_page(t2.screens.active).verify_integrity().unwrap();
+        }
     }
 
     #[test]
