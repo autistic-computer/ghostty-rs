@@ -928,6 +928,15 @@ impl Screen {
     ///     be filled in at the bottom.
     ///
     pub fn clone(&self, top: Point, bot: Option<Point>) -> Result<Screen, CloneError> {
+        self.clone_inner(top, bot, false)
+    }
+
+    /// Clone the whole screen copy-on-write (see `PageList.Clone.cow`).
+    pub fn clone_preserving(&self) -> Result<Screen, CloneError> {
+        self.clone_inner(Point::Screen(Default::default()), None, true)
+    }
+
+    fn clone_inner(&self, top: Point, bot: Option<Point>, cow: bool) -> Result<Screen, CloneError> {
         // Create a tracked pin remapper for our selection and cursor. Note
         // that we may want to expose this generally in the future but at the
         // time of doing this we don't need to.
@@ -937,6 +946,7 @@ impl Screen {
             top,
             bot,
             tracked_pins: Some(&mut pin_remap),
+            cow,
         })?;
 
         // Find our cursor. If the cursor isn't in the cloned area, we move it

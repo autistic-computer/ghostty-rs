@@ -2,7 +2,7 @@
 //!
 //! STATUS: ported
 //!
-//! A compressed terminal page which retains its resident virtual mapping.
+//! A compressed terminal page with an optional resident virtual mapping.
 //!
 //! Terminal pages have two kinds of state: the large `Page.memory` allocation
 //! and a comparatively small `Page` value containing offsets, dimensions,
@@ -10,15 +10,15 @@
 //! the backing memory, so preserving only the memory bytes is insufficient.
 //! We preserve the complete `Page` value instead. This follows the same model
 //! as `Page.cloneBuf`: page internals use offsets, so a shallow page copy remains
-//! valid when its memory contents are restored at the same address.
+//! valid when its memory contents are restored in another mapping.
 //!
-//! The resident memory is deliberately not freed by this type. `PageList`
-//! keeps the virtual range allocated while asking the operating system to
-//! discard its physical pages. Keeping the range has two useful properties:
-//! the embedded page never contains a dangling pointer, and restoring the page
-//! does not require a fallible allocation.
+//! Live `PageList` nodes keep their virtual range allocated while asking the
+//! operating system to discard physical pages. Immutable clones store an empty
+//! memory slice and reserve a private range on first read. The saved raw length
+//! and offsets let clones restore without retaining a source address.
+//! Live restoration reuses its range and needs no allocation.
 //!
-//! The intended state transition is:
+//! The live-page state transition is:
 //!
 //! 1. Create this value while the source page is resident.
 //! 2. Ask the OS to decommit the source page's memory.
@@ -39,23 +39,56 @@
 //! Port notes: `encoded` is a raw slice pointer allocated from `alloc`
 //! (Zig: `[]u8` owned by an `Allocator`), and `deinit` stays explicit
 //! because the PageList node owning this value decides when to release it.
+//! `shared` is a raw pointer to the reference count allocated from `alloc`
+//! next to `encoded`; clones made by `clone_for` with the same allocator
+//! share both and the last `deinit` frees them.
 
 use core::fmt;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::lz4;
 use crate::terminal::page::{Page as TerminalPage, PageMemory};
 use crate::terminal::page_list::Allocator;
+use crate::terminal::size::AllocError;
+
+/// Copy `bytes` into a new allocation from `alloc` (Zig: `alloc.dupe`).
+fn dupe(alloc: Allocator, bytes: &[u8]) -> Result<*mut [u8], AllocError> {
+    let ptr = alloc.alloc_bytes(bytes.len(), 1)?;
+    // SAFETY: `ptr` is a fresh allocation of `bytes.len()` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
+    Ok(core::ptr::slice_from_raw_parts_mut(ptr.as_ptr(), bytes.len()))
+}
+
+/// Free an encoding allocated by `dupe`.
+///
+/// # Safety
+///
+/// `encoded` must come from `dupe` with the same allocator and not be used
+/// afterwards.
+unsafe fn free_encoded(alloc: Allocator, encoded: *mut [u8]) {
+    if let Some(ptr) = NonNull::new(encoded as *mut u8) {
+        unsafe { alloc.free_bytes(ptr, encoded.len(), 1) };
+    }
+}
 
 /// A compressed terminal page (Zig: `compress.Page`).
 #[derive(Debug)]
 pub struct Page {
-    /// Complete page metadata together with the retained resident mapping.
+    /// Complete page metadata together with an optional resident mapping.
     ///
     /// The bytes in `page.memory` may have been discarded by the OS while this
     /// value is in compressed state. They must not be read until `restore` has
     /// successfully decoded the page.
     pub page: TerminalPage,
+
+    /// Length of the raw page memory the encoding decodes to. An immutable
+    /// clone keeps it while `page.memory` is empty.
+    pub raw_len: usize,
+
+    /// Allocator for the private raw mapping of an immutable clone, set by
+    /// `clone_for`. A live page restores into its retained mapping instead.
+    pub mapping_alloc: Option<Allocator>,
 
     /// Exact raw LZ4 block for `page.memory`.
     pub encoded: *mut [u8],
@@ -66,6 +99,32 @@ pub struct Page {
     /// the allocator here lets a PageList node restore and discard its compressed
     /// state without needing a reference back to the PageList.
     pub alloc: Allocator,
+
+    /// Reference count of `encoded`, shared by every clone of this page
+    /// made with the same allocator. Allocated from `alloc`.
+    pub shared: NonNull<Shared>,
+}
+
+/// The reference count shared by compressed clones (Zig: `Page.Shared`).
+#[derive(Debug)]
+pub struct Shared {
+    pub references: AtomicUsize,
+}
+
+/// Whether two allocator handles are the same allocator, so memory from one
+/// can be freed through the other (Zig: `sameAllocator`).
+///
+/// Zig compares vtables first and recognizes its singleton allocators, whose
+/// context pointers are undefined. Here the Rust global allocator handle is
+/// the singleton, and a backend is a `'static` allocator object that is the
+/// same allocator only as the same object with the same implementation. A
+/// false negative only costs a copy of the encoding.
+fn same_allocator(left: Allocator, right: Allocator) -> bool {
+    match (left.backend(), right.backend()) {
+        (None, None) => true,
+        (Some(l), Some(r)) => core::ptr::eq(l, r),
+        _ => false,
+    }
 }
 
 /// `Allocator.Error || lz4.CompressError` (Zig: the error set of `init`).
@@ -169,18 +228,63 @@ impl Page {
                 < core::mem::size_of::<TerminalPage>() + source.memory.len()
         );
 
-        // alloc.dupe
-        let ptr = alloc
-            .alloc_bytes(encoded_len, 1)
-            .map_err(|_| InitError::OutOfMemory)?;
-        // SAFETY: `ptr` is a fresh allocation of `encoded_len` bytes.
-        unsafe { core::ptr::copy_nonoverlapping(scratch.as_ptr(), ptr.as_ptr(), encoded_len) };
+        let encoded = dupe(alloc, &scratch[..encoded_len]).map_err(|_| InitError::OutOfMemory)?;
+        let shared = match alloc.create(Shared {
+            references: AtomicUsize::new(1),
+        }) {
+            Ok(v) => v,
+            Err(_) => {
+                // SAFETY: allocated by `dupe` above.
+                unsafe { free_encoded(alloc, encoded) };
+                return Err(InitError::OutOfMemory);
+            }
+        };
 
         Ok(Some(Page {
             page: *source,
-            encoded: core::ptr::slice_from_raw_parts_mut(ptr.as_ptr(), encoded_len),
+            raw_len: source.memory.len(),
+            mapping_alloc: None,
+            encoded,
             alloc,
+            shared,
         }))
+    }
+
+    /// Make an immutable clone of this page for another owner.
+    ///
+    /// The clone starts with an empty `page.memory`; its owner maps a
+    /// private range of `raw_len` bytes from `page_alloc` on first read.
+    /// The encoding is shared when `alloc` is the allocator that owns it,
+    /// and copied into `alloc` otherwise.
+    pub fn clone_for(&self, alloc: Allocator, page_alloc: Allocator) -> Result<Page, AllocError> {
+        let mut result = Page {
+            page: self.page,
+            raw_len: self.raw_len,
+            mapping_alloc: self.mapping_alloc,
+            encoded: self.encoded,
+            alloc: self.alloc,
+            shared: self.shared,
+        };
+        result.page.memory = PageMemory::EMPTY;
+        result.mapping_alloc = Some(page_alloc);
+        if same_allocator(self.alloc, alloc) {
+            // SAFETY: `shared` lives while any page holding it lives.
+            unsafe { self.shared.as_ref() }.references.fetch_add(1, Ordering::Relaxed);
+            return Ok(result);
+        }
+        result.encoded = dupe(alloc, self.encoded())?;
+        result.shared = match alloc.create(Shared {
+            references: AtomicUsize::new(1),
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY: allocated by `dupe` above.
+                unsafe { free_encoded(alloc, result.encoded) };
+                return Err(e);
+            }
+        };
+        result.alloc = alloc;
+        Ok(result)
     }
 
     /// The encoded block (Zig: reading `encoded`).
@@ -190,17 +294,23 @@ impl Page {
         unsafe { &*self.encoded }
     }
 
-    /// Free the encoded block.
+    /// Release this page's reference to the encoded block, freeing it with
+    /// the last reference.
     ///
     /// This intentionally does not free `page.memory`. The PageList node which
     /// supplied the source page continues to own that pool or heap allocation.
     pub fn deinit(&mut self) {
-        let len = self.encoded.len();
-        if let Some(ptr) = NonNull::new(self.encoded as *mut u8) {
-            // SAFETY: allocated with `alloc_bytes(len, 1)` in `init`.
-            unsafe { self.alloc.free_bytes(ptr, len, 1) };
+        // SAFETY: `shared` lives while any page holding it lives. AcqRel
+        // orders every other owner's last use of `encoded` before the free.
+        if unsafe { self.shared.as_ref() }.references.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // SAFETY: the last reference; both were allocated from `alloc`.
+            unsafe {
+                free_encoded(self.alloc, self.encoded);
+                self.alloc.destroy(self.shared);
+            }
         }
         self.encoded = core::ptr::slice_from_raw_parts_mut(NonNull::<u8>::dangling().as_ptr(), 0);
+        self.shared = NonNull::dangling();
     }
 
     /// Restore the embedded terminal page into its retained resident mapping.
@@ -212,6 +322,7 @@ impl Page {
     /// it does not own a new allocation.
     pub fn restore(&self) -> Result<TerminalPage, lz4::DecompressError> {
         let result = self.page;
+        assert_eq!(result.memory.len(), self.raw_len);
         // SAFETY: the retained mapping is valid (and recommitted) memory owned
         // by the node; nothing else accesses it while it is compressed.
         let output = unsafe { result.memory.as_mut_slice() };
@@ -232,12 +343,12 @@ impl Page {
     /// `memory` must be valid, page-aligned, writable memory that doesn't
     /// overlap the retained mapping.
     pub unsafe fn clone_buf(&self, memory: PageMemory) -> Result<TerminalPage, lz4::DecompressError> {
-        assert!(memory.len() >= self.page.memory.len());
+        assert!(memory.len() >= self.raw_len);
 
         // Page internals are offsets into the backing buffer, so all metadata can
         // be copied verbatim when paired with an equally laid-out mapping.
         let mut result = self.page;
-        result.memory = memory.prefix(self.page.memory.len());
+        result.memory = memory.prefix(self.raw_len);
         // SAFETY: caller contract.
         let output = unsafe { result.memory.as_mut_slice() };
         lz4::decompress(self.encoded(), output)?;
@@ -429,5 +540,64 @@ mod tests {
         assert_eq!(&expected[..], unsafe { restored.memory.as_slice() });
 
         compressed.deinit();
+    }
+
+    fn refs(page: &Page) -> usize {
+        unsafe { page.shared.as_ref() }.references.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn copy_on_write_compressed_singleton_allocators_share_encoding() {
+        // Zig checks its c, page and smp allocators; the Rust singletons are
+        // the global allocator handle and the OS page allocator.
+        let allocators = [Allocator::GLOBAL, Allocator::page()];
+        let other = FailingAllocator::leak(usize::MAX);
+        let resident = TestPage(TerminalPage::init(Capacity::new(12, 9)).unwrap());
+        unsafe { *resident.get_row_and_cell(2, 3).cell = Cell::init('Q' as u32) };
+        let mut scratch = vec![0u8; Page::required_scratch(resident.memory.len()).unwrap()];
+        let memory = AlignedBuf::new(resident.memory.len());
+        let mut table = new_table();
+        for alloc in allocators {
+            assert!(same_allocator(alloc, alloc));
+            assert!(!same_allocator(alloc, other.allocator()));
+            let mut source = Page::init(alloc, &resident, &mut scratch, &mut table).unwrap().unwrap();
+            let mut frozen = source.clone_for(alloc, Allocator::GLOBAL).unwrap();
+            assert_eq!(source.encoded as *mut u8, frozen.encoded as *mut u8);
+            assert_eq!(2, refs(&source));
+            source.deinit();
+            frozen.page.memory = memory.memory();
+            let restored = frozen.restore().unwrap();
+            assert_eq!('Q' as u32, unsafe { (*restored.get_row_and_cell(2, 3).cell).codepoint() });
+            frozen.deinit();
+        }
+    }
+
+    #[test]
+    fn copy_on_write_compressed_custom_allocators_preserve_allocator_identity() {
+        // Zig uses two FixedBufferAllocators; here two distinct allocator
+        // objects.
+        let left = FailingAllocator::leak(usize::MAX).allocator();
+        let right = FailingAllocator::leak(usize::MAX).allocator();
+        assert!(same_allocator(left, left));
+        assert!(!same_allocator(left, right));
+        let resident = TestPage(TerminalPage::init(Capacity::new(12, 9)).unwrap());
+        unsafe { *resident.get_row_and_cell(4, 5).cell = Cell::init('R' as u32) };
+        let mut scratch = vec![0u8; Page::required_scratch(resident.memory.len()).unwrap()];
+        let memory = AlignedBuf::new(resident.memory.len());
+        let mut table = new_table();
+        let mut source = Page::init(left, &resident, &mut scratch, &mut table).unwrap().unwrap();
+        let mut shared = source.clone_for(left, Allocator::GLOBAL).unwrap();
+        let mut copied = source.clone_for(right, Allocator::GLOBAL).unwrap();
+        assert_eq!(source.encoded as *mut u8, shared.encoded as *mut u8);
+        assert_ne!(source.encoded as *mut u8, copied.encoded as *mut u8);
+        assert_eq!(source.encoded(), copied.encoded());
+        assert_eq!(2, refs(&source));
+        assert_eq!(1, refs(&copied));
+        copied.page.memory = memory.memory();
+        let restored = copied.restore().unwrap();
+        assert_eq!('R' as u32, unsafe { (*restored.get_row_and_cell(4, 5).cell).codepoint() });
+        copied.deinit();
+        shared.deinit();
+        source.deinit();
     }
 }

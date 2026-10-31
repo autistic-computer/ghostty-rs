@@ -45,8 +45,17 @@ impl CGridRef {
         }
     }
 
+    /// The pin this ref names, or None for a null node or coordinates
+    /// outside the node's dimensions. A non-null node must be live.
     pub fn to_pin(&self) -> Option<Pin> {
-        let mut pin = Pin::new(self.node?);
+        let node = self.node?;
+        // SAFETY: a non-null node is live (callers' contract); only its
+        // metadata is read.
+        let n = unsafe { node.as_ref() };
+        if self.x >= n.cols() || self.y >= n.rows() {
+            return None;
+        }
+        let mut pin = Pin::new(node);
         pin.x = self.x;
         pin.y = self.y;
         Some(pin)
@@ -64,7 +73,7 @@ pub unsafe extern "C" fn grid_ref_cell(ref_: &CGridRef, out: *mut CCell) -> Resu
         return Result::InvalidValue;
     };
     if let Some(o) = out.as_mut() {
-        *o = (*p.row_and_cell().cell).cval();
+        *o = (*p.row_and_cell_read().cell).cval();
     }
     Result::Success
 }
@@ -79,7 +88,7 @@ pub unsafe extern "C" fn grid_ref_row(ref_: &CGridRef, out: *mut CRow) -> Result
         return Result::InvalidValue;
     };
     if let Some(o) = out.as_mut() {
-        *o = (*p.row_and_cell().row).cval();
+        *o = (*p.row_and_cell_read().row).cval();
     }
     Result::Success
 }
@@ -99,7 +108,7 @@ pub unsafe extern "C" fn grid_ref_graphemes(
     let Some(p) = ref_.to_pin() else {
         return Result::InvalidValue;
     };
-    let cell = &*p.row_and_cell().cell;
+    let cell = &*p.row_and_cell_read().cell;
 
     if !cell.has_text() {
         *out_len = 0;
@@ -107,7 +116,11 @@ pub unsafe extern "C" fn grid_ref_graphemes(
     }
 
     let cp = cell.codepoint();
-    let extra = if cell.has_grapheme() { p.grapheme(cell) } else { None };
+    let extra = if cell.has_grapheme() {
+        (*p.node.as_ptr()).page_read().lookup_grapheme(cell)
+    } else {
+        None
+    };
     let total = 1 + extra.map_or(0, |e| e.len());
 
     if out_buf.is_null() || buf_len < total {
@@ -139,7 +152,7 @@ pub unsafe extern "C" fn grid_ref_hyperlink_uri(
     let Some(p) = ref_.to_pin() else {
         return Result::InvalidValue;
     };
-    let terminal_page = (*p.node.as_ptr()).page();
+    let terminal_page = (*p.node.as_ptr()).page_read();
     let rac = terminal_page.get_row_and_cell(p.x as usize, p.y as usize);
     let cell = &*rac.cell;
 
@@ -175,11 +188,11 @@ pub unsafe extern "C" fn grid_ref_style(ref_: &CGridRef, out: *mut style_c::Styl
         return Result::InvalidValue;
     };
     if let Some(o) = out.as_mut() {
-        let cell = &*p.row_and_cell().cell;
+        let cell = &*p.row_and_cell_read().cell;
         if cell.style_id() == stylepkg::DEFAULT_ID {
             *o = style_c::Style::from_style(&stylepkg::Style::default());
         } else {
-            let terminal_page = (*p.node.as_ptr()).page();
+            let terminal_page = (*p.node.as_ptr()).page_read();
             *o = style_c::Style::from_style(&*terminal_page.styles.get(terminal_page.memory, cell.style_id()));
         }
     }
@@ -191,6 +204,7 @@ mod tests {
     use super::*;
     use crate::lib::allocator::C_ALLOCATOR;
     use crate::terminal::c::terminal as terminal_c;
+    use crate::terminal::page_list::{self, PageList};
     use crate::terminal::point::{Coordinate, Point};
 
     #[test]
@@ -307,5 +321,42 @@ mod tests {
             assert_eq!(b"https://example.com", &buf[..len]);
             terminal_c::free(terminal);
         }
+    }
+
+    #[test]
+    fn copy_on_write_grid_references_reject_coordinates_outside_node_dimensions() {
+        let mut list = PageList::init(page_list::Options {
+            cols: 10,
+            rows: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        list.cols = 80;
+        let mut r = CGridRef::from_pin(list.pin(Point::Screen(Coordinate::default())).unwrap());
+        r.x = 79;
+        let mut len: usize = 0;
+        unsafe {
+            assert!(r.to_pin().is_none());
+            assert_eq!(Result::InvalidValue, grid_ref_cell(&r, std::ptr::null_mut()));
+            assert_eq!(Result::InvalidValue, grid_ref_row(&r, std::ptr::null_mut()));
+            assert_eq!(Result::InvalidValue, grid_ref_style(&r, std::ptr::null_mut()));
+            assert_eq!(
+                Result::InvalidValue,
+                grid_ref_graphemes(&r, std::ptr::null_mut(), 0, &mut len)
+            );
+            assert_eq!(
+                Result::InvalidValue,
+                grid_ref_hyperlink_uri(&r, std::ptr::null_mut(), 0, &mut len)
+            );
+            r.x = 0;
+            r.y = 2;
+            assert!(r.to_pin().is_none());
+            assert_eq!(Result::InvalidValue, grid_ref_cell(&r, std::ptr::null_mut()));
+            r.x = 9;
+            r.y = 1;
+            assert!(r.to_pin().is_some());
+            assert_eq!(Result::Success, grid_ref_cell(&r, std::ptr::null_mut()));
+        }
+        list.cols = 10;
     }
 }

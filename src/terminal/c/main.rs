@@ -240,6 +240,7 @@ pub use self::terminal::free as terminal_free;
 pub use self::terminal::get as terminal_get;
 pub use self::terminal::get_multi as terminal_get_multi;
 pub use self::terminal::new as terminal_new;
+pub use self::terminal::clone_screen as terminal_clone_screen;
 pub use self::terminal::reset as terminal_reset;
 pub use self::terminal::resize as terminal_resize;
 pub use self::terminal::scroll_viewport as terminal_scroll_viewport;

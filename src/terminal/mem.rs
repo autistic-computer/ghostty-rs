@@ -173,7 +173,8 @@ fn assert_page_range(memory: &[u8]) {
 /// ```
 ///
 /// In test builds this never calls into the operating system. It clears the
-/// dirty prefix and returns true, which imitates a successful release.
+/// whole range and returns true, as MADV_DONTNEED would, so a test sees any
+/// live bytes a caller wrongly hands over.
 ///
 /// The memory must be private to this process (e.g. its own anonymous
 /// mapping or page allocation): the OS may discard every byte in the range.
@@ -188,7 +189,7 @@ pub fn decommit(mode: DecommitMode, memory: &mut [u8], dirty_len: usize) -> bool
     // so madvise is not safe. Zeroing models the only content guarantee callers
     // have after a successful discard.
     if cfg!(test) {
-        memory[..dirty_len].fill(0);
+        memory.fill(0);
         return true;
     }
 
