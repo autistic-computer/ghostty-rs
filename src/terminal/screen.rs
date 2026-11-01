@@ -1177,6 +1177,7 @@ impl Screen {
         debug_assert!(!core::ptr::eq(src_page, node_page(node) as *const Page));
 
         let mut current = node;
+        let mut rehashed = false;
         loop {
             let cur_page = node_page(current);
             let dst_row = rw(cur_page.get_row(dst_y));
@@ -1188,7 +1189,9 @@ impl Screen {
                 Err(err) => {
                     // Adjust our page capacity to make room for what we
                     // didn't have space for and retry the copy.
-                    current = match self.increase_capacity(current, IncreaseCapacity::for_clone_error(err)) {
+                    let adjustment = IncreaseCapacity::for_clone_retry(err, rehashed);
+                    rehashed = adjustment.is_none();
+                    current = match self.increase_capacity(current, adjustment) {
                         Ok(n) => n,
                         // We can't gracefully recover from either of these
                         // here: our callers have already rotated or shifted

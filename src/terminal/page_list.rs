@@ -1728,6 +1728,24 @@ pub enum IncreaseCapacity {
 }
 
 impl IncreaseCapacity {
+    /// The adjustment for a row copy retry loop (Zig: `forCloneRetry`). A
+    /// rehash reclones the page as it is, including whatever part of the
+    /// row the failed copy already wrote, and the retry then releases that
+    /// part again, so the set can be left exactly as full as before. When a
+    /// copy still needs a rehash right after one, grow the set instead,
+    /// which always makes progress.
+    pub fn for_clone_retry(err: pagepkg::CloneFromError, rehashed: bool) -> Option<IncreaseCapacity> {
+        use pagepkg::CloneFromError as E;
+        if rehashed {
+            match err {
+                E::StyleSetNeedsRehash => return Some(IncreaseCapacity::Styles),
+                E::HyperlinkSetNeedsRehash => return Some(IncreaseCapacity::HyperlinkBytes),
+                _ => {}
+            }
+        }
+        Self::for_clone_error(err)
+    }
+
     /// Returns the capacity dimension that must be increased for the
     /// given row clone error to succeed on retry, or null if the page
     /// only needs to be rehashed at its current capacity.
@@ -5482,13 +5500,16 @@ impl PageList {
             assert!(src_page != nd(node).page() as *mut Page);
 
             let mut current = node;
+            let mut rehashed = false;
             loop {
                 let cur_page = nd(current).page();
                 let cur_rows = cur_page.rows.ptr(cur_page.memory);
                 if let Err(err) = cur_page.clone_row_from(src_page, &mut *cur_rows.add(dst_y), &*src_row) {
                     // Adjust our page capacity to make room for what we
                     // didn't have space for.
-                    current = match self.increase_capacity(current, IncreaseCapacity::for_clone_error(err)) {
+                    let adjustment = IncreaseCapacity::for_clone_retry(err, rehashed);
+                    rehashed = adjustment.is_none();
+                    current = match self.increase_capacity(current, adjustment) {
                         Ok(n) => n,
                         // We can't gracefully recover from either of these
                         // here: our callers have already rotated rows, so
@@ -11308,6 +11329,19 @@ mod tests {
         let continued = s.compress(CompressMode::Incremental);
         assert_eq!(IncrementalCompressionResult::Pending, continued);
         assert!(s.page_compression.flags.verifying);
+    }
+
+    #[test]
+    fn page_list_clone_retry_grows_a_set_that_still_needs_a_rehash_after_one() {
+        use pagepkg::CloneFromError as E;
+        // The first rehash is free to try; the second one in a row means a
+        // rehash can't make room, so the set grows instead.
+        assert_eq!(None, IncreaseCapacity::for_clone_retry(E::HyperlinkSetNeedsRehash, false));
+        assert_eq!(Some(IncreaseCapacity::HyperlinkBytes), IncreaseCapacity::for_clone_retry(E::HyperlinkSetNeedsRehash, true));
+        assert_eq!(None, IncreaseCapacity::for_clone_retry(E::StyleSetNeedsRehash, false));
+        assert_eq!(Some(IncreaseCapacity::Styles), IncreaseCapacity::for_clone_retry(E::StyleSetNeedsRehash, true));
+        // Other errors already ask for growth.
+        assert_eq!(Some(IncreaseCapacity::StringBytes), IncreaseCapacity::for_clone_retry(E::StringAllocOutOfMemory, true));
     }
 
     #[test]

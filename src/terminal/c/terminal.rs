@@ -7077,6 +7077,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn clone_row_copy_that_keeps_needing_a_rehash_grows_instead_of_looping() {
+        // An operation log from differential fuzzing: N cols rows, R cols
+        // rows, W length bytes, and K (continue on a clone of the screen).
+        // Its final scroll down copies a row with many hyperlinks into a
+        // page whose hyperlink set needed a rehash again right after each
+        // rehash, and the copy retried forever.
+        let ops: &[u8] = include_bytes!("../testdata/clone-row-copy-rehash-livelock.bin");
+        let word = |at: usize| u32::from_le_bytes(ops[at..at + 4].try_into().unwrap());
+        let mut t: Terminal = std::ptr::null_mut();
+        let mut i = 0;
+        while i < ops.len() {
+            let op = ops[i];
+            i += 1;
+            match op {
+                b'N' | b'R' => {
+                    let (cols, rows) = (word(i) as CellCountInt, word(i + 4) as CellCountInt);
+                    i += 8;
+                    if op == b'N' {
+                        if !t.is_null() {
+                            unsafe { free(t) };
+                        }
+                        t = new_t(cols, rows);
+                    } else {
+                        assert_eq!(Result::Success, unsafe { resize(t, cols, rows, 8, 16) });
+                    }
+                }
+                b'W' => {
+                    let len = word(i) as usize;
+                    i += 4;
+                    vw(t, &ops[i..i + len]);
+                    i += len;
+                }
+                b'K' => {
+                    let mut clone: Terminal = std::ptr::null_mut();
+                    assert_eq!(Result::Success, unsafe { clone_screen(t, &mut clone) });
+                    unsafe { free(t) };
+                    t = clone;
+                }
+                _ => unreachable!(),
+            }
+        }
+        unsafe { free(t) };
+    }
+
+    #[test]
     fn copy_on_write_terminal_clone_preserves_cursor_defaults_and_fresh_parser_after_source_drop() {
         let source = new_t(12, 4);
         let default_style = TerminalCursorStyle::Underline;
