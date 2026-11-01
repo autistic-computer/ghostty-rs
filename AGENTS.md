@@ -1,6 +1,11 @@
 # AGENTS.md
 
-ghrossty (repo autistic-computer/ghrossty, private) is a file-for-file Rust port of the
+Read `~/dev/autistic-computer/.agents/AGENTS.md` first: the rules every autistic-computer repo
+shares. This file adds what is specific to ghostty-rs.
+
+@~/dev/autistic-computer/.agents/AGENTS.md
+
+ghostty-rs (repo autistic-computer/ghostty-rs) is a file-for-file Rust port of the
 Ghostty terminal, currently at upstream revision 93967b7. Its main job is to be zz's terminal
 engine: built with the `lib-vt` feature it exports the same `ghostty_*` C API as zz's vendored
 Zig libghostty-vt, including zz's additions (screen clones, row cell copies, render state clips,
@@ -32,6 +37,4 @@ The repo's `.cargo/config.toml` limits builds to two jobs for a small box; set
 - Behavior must match zz's Zig engine. Check changes to terminal state, rendering or the C API
   against it with a C program built once per library from the same source.
 - Speed and memory claims come with numbers from both engines measured in the same run.
-- No AI attribution in commits or PRs: no co-author trailer with an email, no model or product
-  names. A co-author trailer is a funny name with no email.
-- Several agents share checkouts: never stash, hard-reset or clean work you did not write.
+- Ported files keep upstream's comments, so the shared no-comments rule does not apply to them.
