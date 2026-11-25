@@ -10,7 +10,7 @@
 ---<br>
 name: ghostty-rs<br>
 description: ghostty in rust<br>
-status: alpha<br>
+status: slopware<br>
 license: mit<br>
 version: 1.4.1<br>
 ---
